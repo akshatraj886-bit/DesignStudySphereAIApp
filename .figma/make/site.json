@@ -1,0 +1,10 @@
+{
+  "description": "Helps college students upload PDFs to ask questions, generate summaries, and create revision questions for effective study and topic understanding.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
