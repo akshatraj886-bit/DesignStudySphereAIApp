@@ -171,12 +171,14 @@ export interface EvaluateQuizResponse {
 }
 
 // Configurable API base URL from environment variable VITE_API_BASE_URL.
-// In local development, defaults to local FastAPI server (http://127.0.0.1:8000).
-// In production, strictly requires VITE_API_BASE_URL with no hardcoded localhost fallback.
+// Defaults to the deployed Render backend in production and local server in development.
 // Trailing slashes are automatically removed to ensure valid URL concatenation.
+const DEFAULT_PROD_API_URL = "https://studysphere-ai-backend-dqi2.onrender.com"
 const envBaseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim()
-const rawApiBaseUrl = envBaseUrl || (import.meta.env.DEV ? "http://127.0.0.1:8000" : "")
+const rawApiBaseUrl =
+  envBaseUrl || (import.meta.env.DEV ? "http://127.0.0.1:8000" : DEFAULT_PROD_API_URL)
 export const API_BASE_URL = rawApiBaseUrl.replace(/\/+$/, "")
+
 
 
 const SESSION_TOKEN_STORAGE_KEY = "studysphere_session_token"
