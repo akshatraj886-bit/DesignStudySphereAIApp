@@ -1,0 +1,33 @@
+# Git and IDE
+.git
+.gitignore
+.agents
+.gemini
+
+# Environment and secrets (CRITICAL: Never bake .env into docker image)
+.env
+.env.local
+.env.*
+!.env.example
+
+# Local SQLite databases and backups
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.backup*
+data/studysphere.db*
+
+# Python bytecode & virtual environments
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Test caches & temporary artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+*.log

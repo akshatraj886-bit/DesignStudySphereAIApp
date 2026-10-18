@@ -157,3 +157,173 @@ button:focus-visible,a:focus-visible { outline-color: #dfbcff; }
   .glass-entrance { animation: none; }
   *,*::before,*::after { transition-duration: .01ms!important; scroll-behavior: auto!important; }
 }
+
+/* ==========================================================================
+   CONVERSATION & ASK YOUR NOTES - ULTRA-READABLE HIGH-CONTRAST STYLING
+   ========================================================================== */
+.conversation-panel {
+  background: rgba(18, 24, 48, 0.72) !important;
+  border: 1px solid rgba(139, 92, 246, 0.22) !important;
+  border-radius: 20px !important;
+}
+
+.conversation-body {
+  padding: 24px 20px !important;
+}
+
+.message-pair {
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 16px !important;
+  margin-bottom: 28px !important;
+}
+
+/* User Message Bubble */
+.user-message {
+  display: flex !important;
+  align-items: flex-start !important;
+  gap: 14px !important;
+  padding: 16px 20px !important;
+  background: linear-gradient(135deg, rgba(124, 58, 237, 0.28), rgba(99, 102, 241, 0.18)) !important;
+  border: 1px solid rgba(167, 139, 250, 0.38) !important;
+  border-radius: 16px !important;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25) !important;
+  width: 100% !important;
+  box-sizing: border-box !important;
+}
+
+.user-message .avatar {
+  background: linear-gradient(135deg, #7c3aed, #4f46e5) !important;
+  color: #ffffff !important;
+  font-weight: 700 !important;
+  box-shadow: 0 0 12px rgba(124, 58, 237, 0.5) !important;
+}
+
+.user-message strong {
+  color: #c7d2fe !important;
+  font-size: 13px !important;
+  font-weight: 700 !important;
+  display: block !important;
+  margin-bottom: 4px !important;
+}
+
+.user-message p {
+  color: #ffffff !important;
+  font-size: 14.5px !important;
+  font-weight: 500 !important;
+  line-height: 1.6 !important;
+  margin: 0 !important;
+}
+
+/* AI Answer Bubble */
+.answer-message {
+  display: flex !important;
+  align-items: flex-start !important;
+  gap: 14px !important;
+  padding: 22px 24px !important;
+  background: rgba(15, 23, 42, 0.78) !important;
+  border: 1px solid rgba(139, 92, 246, 0.28) !important;
+  border-radius: 18px !important;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35) !important;
+  width: 100% !important;
+  box-sizing: border-box !important;
+}
+
+.answer-message .answer-icon {
+  width: 36px !important;
+  height: 36px !important;
+  min-width: 36px !important;
+  border-radius: 10px !important;
+  background: linear-gradient(135deg, rgba(168, 85, 247, 0.3), rgba(99, 102, 241, 0.3)) !important;
+  border: 1px solid rgba(192, 132, 252, 0.35) !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  color: #e9d5ff !important;
+  box-shadow: 0 0 14px rgba(168, 85, 247, 0.3) !important;
+}
+
+.answer-message strong {
+  color: #f8fafc !important;
+  font-size: 14px !important;
+  font-weight: 700 !important;
+  display: flex !important;
+  align-items: center !important;
+  flex-wrap: wrap !important;
+  gap: 8px !important;
+}
+
+.answer-message strong .sample-tag {
+  background: rgba(147, 51, 234, 0.25) !important;
+  border: 1px solid rgba(192, 132, 252, 0.4) !important;
+  color: #f3e8ff !important;
+  font-size: 11px !important;
+  font-weight: 600 !important;
+  padding: 3px 9px !important;
+  border-radius: 6px !important;
+  letter-spacing: 0.3px !important;
+}
+
+/* Formatted Content Typography */
+.answer-formatted-content {
+  color: #f1f5f9 !important;
+  font-size: 14px !important;
+  line-height: 1.8 !important;
+}
+
+.answer-formatted-content h4 {
+  color: #c4b5fd !important;
+  font-size: 14px !important;
+  font-weight: 700 !important;
+  letter-spacing: 0.4px !important;
+  text-transform: uppercase !important;
+  margin: 16px 0 8px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+}
+
+.answer-formatted-content p {
+  color: #f1f5f9 !important;
+  font-size: 14px !important;
+  line-height: 1.8 !important;
+  margin: 8px 0 !important;
+}
+
+.answer-formatted-content strong {
+  color: #ffffff !important;
+  font-weight: 700 !important;
+  background: rgba(168, 85, 247, 0.22) !important;
+  border: 1px solid rgba(192, 132, 252, 0.3) !important;
+  padding: 1px 6px !important;
+  border-radius: 4px !important;
+  display: inline-block !important;
+}
+
+/* Sources & Citations Box */
+.sources {
+  background: rgba(15, 23, 42, 0.65) !important;
+  border: 1px solid rgba(139, 92, 246, 0.22) !important;
+  border-radius: 12px !important;
+  padding: 16px !important;
+  margin-top: 18px !important;
+}
+
+.source-item-card {
+  background: rgba(30, 41, 59, 0.75) !important;
+  border: 1px solid rgba(148, 163, 184, 0.2) !important;
+  border-radius: 8px !important;
+  padding: 12px 14px !important;
+}
+
+.source-item-card p {
+  color: #c4b5fd !important;
+  font-weight: 600 !important;
+  font-size: 12px !important;
+}
+
+.source-item-card small {
+  color: #cbd5e1 !important;
+  font-size: 12px !important;
+  line-height: 1.65 !important;
+}

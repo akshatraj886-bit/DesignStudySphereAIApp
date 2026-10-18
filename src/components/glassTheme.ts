@@ -19,7 +19,7 @@ export const glassStyles = {
     fill: "rgba(22,28,58,.94)",
     border: "rgba(255,255,255,.35)",
   },
-} satisfies Record<GlassVariant, { blur: string fill: string border: string }>
+} satisfies Record<GlassVariant, { blur: string; fill: string; border: string }>
 
 export const glassTheme = Object.fromEntries(
   Object.entries(glassStyles).flatMap(([tier, values]) =>

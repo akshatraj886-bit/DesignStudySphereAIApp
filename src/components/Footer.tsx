@@ -15,9 +15,9 @@ export default function Footer({
           <p>
             Your notes. Your questions.
             <br />
-            Instant understanding.
+            Instant, grounded understanding.
           </p>
-          <span className="footer-caption">Built for curious minds.</span>
+          <span className="footer-caption">100% Free &amp; Offline Academic Assistant</span>
         </div>
         <nav aria-label="Footer workspace">
           <h3>WORKSPACE</h3>
@@ -36,31 +36,23 @@ export default function Footer({
           <button onClick={() => onNavigate("AI Summarizer")}>
             AI summarizer
           </button>
-          <a href="#study-plans">Study plans</a>
-          <button onClick={onHelp}>Help & support</button>
+          <button onClick={() => onNavigate("Dashboard")}>Dashboard</button>
+          <button onClick={onHelp}>Help &amp; support</button>
         </nav>
         <nav aria-label="Community links">
-          <h3>STAY CURIOUS</h3>
-          <a
-            href="https://github.com/topics/study-tools"
-            target="_blank"
-            rel="noreferrer"
-          >
-            GitHub study tools ↗
-          </a>
-          <a
-            href="https://www.reddit.com/r/GetStudying/"
-            target="_blank"
-            rel="noreferrer"
-          >
-            Reddit study community ↗
-          </a>
-          <span>Independent learning resources</span>
+          <h3>RESOURCES</h3>
+          <button onClick={() => onNavigate("Ask Your Notes")}>
+            Concept Q&amp;A
+          </button>
+          <button onClick={() => onNavigate("AI Summarizer")}>
+            Quick Summaries
+          </button>
+          <span>Grounded in your notes</span>
         </nav>
       </div>
       <div className="footer-bottom">
-        <span>StudySphere AI · A space for your next breakthrough.</span>
-        <span>Interactive prototype · Sample data only</span>
+        <span>StudySphere AI · Offline-First RAG &amp; Revision Companion</span>
+        <span>Final Year Capstone Project · Computer Science &amp; Engineering</span>
       </div>
     </footer>
   )

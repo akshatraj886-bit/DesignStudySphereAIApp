@@ -1,12 +1,35 @@
-import { useRef, useState, type ReactNode } from "react"
+import { useEffect, useRef, useState, type ReactNode } from "react"
 import GradientBackground from "./components/GradientBackground"
 import GlassNavbar from "./components/GlassNavbar"
 import Hero from "./components/Hero"
 import Features from "./components/Features"
-import Pricing from "./components/Pricing"
 import Footer from "./components/Footer"
 import GlassInput from "./components/GlassInput"
 import { glassTheme } from "./components/glassTheme"
+import {
+  uploadPDFDocument,
+  askQuestion,
+  fetchStoredDocuments,
+  deleteDocument,
+  summarizeDocument,
+  generateQuestions,
+  evaluateQuiz,
+  createChatSession,
+  listChatSessions,
+  getChatMessages,
+  askInChatSession,
+  type PageContent,
+  type SourceChunk,
+  type SummaryMode,
+  type SummarizeResponse,
+  type TopicSection,
+  type QuestionItem,
+  type QuestionType,
+  type QuestionDifficulty,
+  type EvaluateQuizResponse,
+  type QuestionAnswerSubmission,
+} from "./lib/api"
+
 
 type IconName = "grid" | "file" | "chat" | "spark" | "cards" | "settings" | "help" | "arrow" | "upload" | "search" | "chevron" | "close" | "check" | "clock" | "plus" | "bell" | "menu" | "send" | "book" | "more" | "logout"
 function Icon({
@@ -128,7 +151,7 @@ function Icon({
     </svg>
   )
 }
-const navigation: { name: string icon: IconName }[] = [
+const navigation: { name: string; icon: IconName }[] = [
   { name: "Dashboard", icon: "grid" },
   { name: "My Documents", icon: "file" },
   { name: "Ask Your Notes", icon: "chat" },
@@ -137,51 +160,44 @@ const navigation: { name: string icon: IconName }[] = [
 ]
 type Doc = {
   id: number
+  backendDocId?: string
   name: string
   subject: string
   size: string
   pages: number
   date: string
   color: string
+  // Real extraction & RAG fields from FastAPI backend
+  totalCharacters?: number
+  totalWords?: number
+  chunkCount?: number
+  hasExtractableText?: boolean
+  ocrSuggested?: boolean
+  extractedPages?: PageContent[]
+  statusMessage?: string
 }
-const initialDocs: Doc[] = [
-  {
-    id: 1,
-    name: "DBMS – Unit 3: Normalization",
-    subject: "Database Management",
-    size: "2.4 MB",
-    pages: 24,
-    date: "Today",
-    color: "purple",
-  },
-  {
-    id: 2,
-    name: "Data Structures & Algorithms",
-    subject: "Data Structures",
-    size: "3.8 MB",
-    pages: 42,
-    date: "Yesterday",
-    color: "blue",
-  },
-  {
-    id: 3,
-    name: "Introduction to Artificial Intelligence",
-    subject: "Artificial Intelligence",
-    size: "1.6 MB",
-    pages: 18,
-    date: "Oct 22, 2024",
-    color: "peach",
-  },
-  {
-    id: 4,
-    name: "Operating Systems – Process Management",
-    subject: "Operating Systems",
-    size: "2.1 MB",
-    pages: 32,
-    date: "Oct 20, 2024",
-    color: "green",
-  },
-]
+export type ActivityItem = {
+  id: string
+  type: "upload" | "ask" | "summary" | "quiz"
+  icon: IconName
+  color: string
+  title: string
+  description: string
+  time: string
+  timestamp: number
+}
+
+function getDocFormat(filename: string): string {
+  const ext = filename.split(".").pop()?.toUpperCase() || "DOC"
+  if (["PNG", "JPG", "JPEG", "WEBP", "BMP", "TIFF"].includes(ext)) return "IMG"
+  if (["PPT", "PPTX"].includes(ext)) return "PPT"
+  if (["DOC", "DOCX"].includes(ext)) return "DOC"
+  if (["TXT", "MD", "MARKDOWN"].includes(ext)) return "TXT"
+  if (ext === "PDF") return "PDF"
+  return ext.slice(0, 4)
+}
+
+const initialDocs: Doc[] = []
 function Button({
   children,
   onClick,
@@ -259,27 +275,140 @@ function BookArt() {
     </div>
   )
 }
+function FormattedAnswer({ text }: { text: string }) {
+  const lines = text.split("\n")
+  return (
+    <div className="answer-formatted-content" style={{ fontSize: "14px", lineHeight: "1.8", color: "#f1f5f9" }}>
+      {lines.map((line, idx) => {
+        const trimmed = line.trim()
+        if (!trimmed) return <div key={idx} style={{ height: "6px" }} />
+        if (trimmed.startsWith("### ")) {
+          return (
+            <h4
+              key={idx}
+              style={{
+                margin: idx === 0 ? "2px 0 8px" : "18px 0 8px",
+                fontSize: "14px",
+                fontWeight: 700,
+                color: "#c4b5fd",
+                letterSpacing: "0.3px",
+                textTransform: "uppercase",
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+              }}
+            >
+              {trimmed.replace(/^###\s*/, "")}
+            </h4>
+          )
+        }
+        const isListItem = /^\d+\.\s+/.test(trimmed) || trimmed.startsWith("• ") || trimmed.startsWith("- ")
+        const cleanTrimmed = trimmed.replace(/^[-•]\s*/, "")
+        const parts = cleanTrimmed.split(/(\*\*.*?\*\*|\*\(Page \d+\)\*)/g)
+        return (
+          <p
+            key={idx}
+            style={{
+              margin: isListItem ? "6px 0" : "8px 0",
+              paddingLeft: isListItem ? "12px" : "0",
+              lineHeight: 1.75,
+              color: "#f1f5f9",
+            }}
+          >
+            {isListItem && <span style={{ color: "#a78bfa", marginRight: "6px", fontWeight: 700 }}>•</span>}
+            {parts.map((p, pIdx) => {
+              if (p.startsWith("**") && p.endsWith("**")) {
+                return (
+                  <strong key={pIdx} style={{ fontWeight: 700, color: "#ffffff", background: "rgba(168, 85, 247, 0.22)", border: "1px solid rgba(192, 132, 252, 0.35)", padding: "1px 6px", borderRadius: "4px" }}>
+                    {p.slice(2, -2)}
+                  </strong>
+                )
+              }
+              if (p.startsWith("*(Page ") && p.endsWith(")*")) {
+                return (
+                  <span key={pIdx} style={{ color: "#a78bfa", fontWeight: 600, fontSize: "12px", marginLeft: "4px", background: "rgba(99, 102, 241, 0.15)", padding: "1px 5px", borderRadius: "3px" }}>
+                    {p.slice(1, -1)}
+                  </span>
+                )
+              }
+              return p
+            })}
+          </p>
+        )
+      })}
+    </div>
+  )
+}
+
 export default function App() {
   const [page, setPage] = useState("Dashboard")
   const [mobileOpen, setMobileOpen] = useState(false)
-  const [docs, setDocs] = useState(initialDocs)
+  const [docs, setDocs] = useState<Doc[]>(initialDocs)
   const [modal, setModal] =
     useState<"upload" | "rename" | "delete" | "help" | "settings" | null>(null)
-  const [activeDoc, setActiveDoc] = useState(1)
+  const [activeDoc, setActiveDoc] = useState<number>(0)
+  const [activities, setActivities] = useState<ActivityItem[]>(() => {
+    try {
+      const stored = localStorage.getItem("studysphere_activities_v2")
+      return stored ? JSON.parse(stored) : []
+    } catch {
+      return []
+    }
+  })
+
+  const addActivity = (
+    type: ActivityItem["type"],
+    title: string,
+    description: string,
+    icon: IconName,
+    color: string
+  ) => {
+    const newItem: ActivityItem = {
+      id: "act_" + Date.now() + "_" + Math.random().toString(36).substring(2, 7),
+      type,
+      title,
+      description,
+      time: "Just now",
+      timestamp: Date.now(),
+      icon,
+      color,
+    }
+    setActivities((prev) => {
+      const updated = [newItem, ...prev].slice(0, 30)
+      try {
+        localStorage.setItem("studysphere_activities_v2", JSON.stringify(updated))
+      } catch {
+        // ignore
+      }
+      return updated
+    })
+  }
+
   const [rename, setRename] = useState("")
   const [search, setSearch] = useState("")
   const [subject, setSubject] = useState("All subjects")
   const [toast, setToast] = useState("")
   const [uploadName, setUploadName] = useState("")
   const [uploadError, setUploadError] = useState("")
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [uploading, setUploading] = useState(false)
   const [question, setQuestion] = useState("")
   const [messages, setMessages] = useState<{
     question: string
     answer: string
+    cited_sources?: SourceChunk[]
+    retrieved_sources?: SourceChunk[]
+    sources?: SourceChunk[]
+    retrieval_status?: "found" | "insufficient_evidence" | "empty_query" | "no_documents"
+    generation_provider?: string
+    model_name?: string
   }[]>([])
+  const [expandedRetrievals, setExpandedRetrievals] = useState<number[]>([])
   const [busy, setBusy] = useState(false)
-  const [summary, setSummary] = useState(false)
-  const [length, setLength] = useState("Medium")
+  const [summaryMode, setSummaryMode] = useState<SummaryMode>("short")
+  const [summaryResult, setSummaryResult] = useState<SummarizeResponse | null>(null)
+  const [summaryBusy, setSummaryBusy] = useState(false)
+  const [summaryError, setSummaryError] = useState("")
   const [tab, setTab] = useState("Multiple Choice")
   const [count, setCount] = useState("5")
   const [difficulty, setDifficulty] = useState("Medium")
@@ -287,49 +416,433 @@ export default function App() {
   const [expanded, setExpanded] = useState<number[]>([])
   const [saved, setSaved] = useState<number[]>([])
   const [savedOnly, setSavedOnly] = useState(false)
+  // Phase 5: Real revision questions state
+  const [selectedQTypes, setSelectedQTypes] = useState<QuestionType[]>(["mcq"])
+  const [quizQuestions, setQuizQuestions] = useState<QuestionItem[]>([])
+  const [quizSessionId, setQuizSessionId] = useState<string>("")
+  const [userAnswers, setUserAnswers] = useState<Record<string, string>>({})
+  const [quizSubmitted, setQuizSubmitted] = useState(false)
+  const [quizEvaluation, setQuizEvaluation] = useState<EvaluateQuizResponse | null>(null)
+  const [questionsBusy, setQuestionsBusy] = useState(false)
+  const [questionsError, setQuestionsError] = useState("")
+  const [activeSessionId, setActiveSessionId] = useState<string>("")
   const fileInput = useRef<HTMLInputElement>(null)
-  const doc = docs.find((d) => d.id === activeDoc) || docs[0]
+  const doc = docs.find((d) => d.id === activeDoc) || docs[0] || null
+
+  useEffect(() => {
+    // Sync previously uploaded and indexed documents from backend SQLite store
+    fetchStoredDocuments()
+      .then((data) => {
+        if (data.documents && data.documents.length > 0) {
+          const loadedDocs: Doc[] = data.documents.map((d, idx) => ({
+            id: 2000 + idx,
+            backendDocId: d.id,
+            name: d.filename,
+            subject: "Uploaded Notes",
+            size: `${(d.total_characters / 1024).toFixed(1)} KB`,
+            pages: d.page_count,
+            date: new Date(d.created_at).toLocaleDateString(),
+            color: (["purple", "blue", "peach", "green"] as const)[idx % 4],
+            totalCharacters: d.total_characters,
+            totalWords: d.total_words,
+            chunkCount: d.chunk_count,
+            hasExtractableText: d.chunk_count > 0,
+            statusMessage: `Indexed ${d.chunk_count} semantic chunks.`,
+          }))
+
+          setDocs(loadedDocs)
+          setActiveDoc((prev) => {
+            if (loadedDocs.some((ld) => ld.id === prev)) return prev
+            return loadedDocs[0].id
+          })
+        } else {
+          setDocs([])
+        }
+      })
+      .catch(() => {
+        // Backend not yet running; keep existing state
+      })
+  }, [])
+
+  // Synchronize conversational chat sessions and messages for the active document
+  useEffect(() => {
+    const currentBackendDocId = doc?.backendDocId
+    if (!currentBackendDocId || !doc) {
+      setActiveSessionId("")
+      setMessages([])
+      return
+    }
+
+    let isCurrent = true
+    listChatSessions(currentBackendDocId)
+      .then(async (data) => {
+        if (!isCurrent) return
+        if (data.sessions && data.sessions.length > 0) {
+          const session = data.sessions[0]
+          setActiveSessionId(session.id)
+          try {
+            const history = await getChatMessages(session.id)
+            if (!isCurrent) return
+            if (history.messages && history.messages.length > 0) {
+              const pairs: {
+                question: string
+                answer: string
+                cited_sources?: SourceChunk[]
+                retrieved_sources?: SourceChunk[]
+                sources?: SourceChunk[]
+                retrieval_status?: "found" | "insufficient_evidence" | "empty_query" | "no_documents"
+                generation_provider?: string
+                model_name?: string
+              }[] = []
+
+              let currentQ: string | null = null
+              for (const m of history.messages) {
+                if (m.role === "user") {
+                  currentQ = m.content
+                } else if (m.role === "assistant") {
+                  pairs.push({
+                    question: currentQ || "Question",
+                    answer: m.content,
+                    cited_sources: m.cited_sources,
+                    sources: m.cited_sources,
+                    retrieval_status: (m.retrieval_status as any) || "found",
+                    generation_provider: m.generation_provider,
+                  })
+                  currentQ = null
+                }
+              }
+              setMessages(pairs)
+            } else {
+              setMessages([])
+            }
+          } catch {
+            // Keep existing messages on error
+          }
+        } else {
+          // If no session exists yet, create one
+          try {
+            const created = await createChatSession(`Chat - ${doc.name}`, currentBackendDocId)
+            if (isCurrent) {
+              setActiveSessionId(created.id)
+              setMessages([])
+            }
+          } catch {
+            // Backend offline
+          }
+        }
+      })
+      .catch(() => {
+        // Backend offline
+      })
+
+    return () => {
+      isCurrent = false
+    }
+  }, [doc?.backendDocId, doc?.name])
+
+
   const notify = (message: string) => {
     setToast(message)
     window.setTimeout(() => setToast(""), 4500)
+  }
+  const simulate = (action: () => void) => {
+    setBusy(true)
+    setTimeout(() => {
+      setBusy(false)
+      action()
+    }, 450)
   }
   const go = (destination: string) => {
     setPage(destination)
     setMobileOpen(false)
   }
-  const simulate = (done: () => void) => {
-    setBusy(true)
-    window.setTimeout(() => {
-      done()
-      setBusy(false)
-    }, 1100)
-  }
-  const ask = (text = question) => {
+  const ask = async (text = question) => {
     if (!text.trim() || busy || !doc) return
     const q = text.trim()
     setQuestion("")
-    simulate(() =>
-      setMessages((m) => [
-        ...m,
+    setBusy(true)
+
+    try {
+      let currentSessionId = activeSessionId
+      if (!currentSessionId && doc.backendDocId) {
+        try {
+          const created = await createChatSession(`Chat - ${doc.name}`, doc.backendDocId)
+          currentSessionId = created.id
+          setActiveSessionId(created.id)
+        } catch {
+          // Fall back to stateless ask
+        }
+      }
+
+      let res: {
+        question: string
+        answer: string
+        cited_sources?: SourceChunk[]
+        retrieved_sources?: SourceChunk[]
+        sources?: SourceChunk[]
+        retrieval_status: "found" | "insufficient_evidence" | "empty_query" | "no_documents"
+        generation_provider: string
+        model_name?: string
+      }
+
+      if (currentSessionId) {
+        res = await askInChatSession(currentSessionId, q, doc.backendDocId)
+      } else {
+        res = await askQuestion(q, doc.backendDocId)
+      }
+
+      setMessages((prev) => [
+        ...prev,
         {
           question: q,
-          answer: `Here’s an example of how StudySphere could explain a concept from ${doc.name}. Normalization organizes data into related tables to reduce duplication and improve consistency. Think of a student database: instead of repeating a department’s details for every student, store departments in a separate table and connect them with a key. This makes updates simpler and helps prevent inconsistent records.`,
+          answer: res.answer,
+          cited_sources: res.cited_sources || res.sources,
+          retrieved_sources: res.retrieved_sources || res.sources,
+          sources: res.cited_sources || res.sources,
+          retrieval_status: res.retrieval_status,
+          generation_provider: res.generation_provider,
+          model_name: res.model_name,
         },
-      ]),
-    )
+      ])
+      addActivity(
+        "ask",
+        "Question asked",
+        `Asked about "${doc.name}": "${q.length > 50 ? q.slice(0, 50) + "..." : q}"`,
+        "chat",
+        "blue"
+      )
+    } catch (err: unknown) {
+      const errMsg =
+        err && typeof err === "object" && "message" in err
+          ? (err as { message: string }).message
+          : "Could not retrieve answer from backend."
+      setMessages((prev) => [
+        ...prev,
+        {
+          question: q,
+          answer: `Connection Error: ${errMsg}`,
+          retrieval_status: "insufficient_evidence",
+          generation_provider: "error_handler",
+        },
+      ])
+    } finally {
+      setBusy(false)
+    }
   }
+  const handleGenerateQuestions = async () => {
+    if (!doc) {
+      setQuestionsError("Please upload notes before generating revision questions.")
+      return
+    }
+    if (!doc.backendDocId) {
+      setQuestionsError(`"${doc.name}" has not been indexed in SQLite store. Please upload notes first.`)
+      return
+    }
+    setQuestionsBusy(true)
+    setQuestionsError("")
+    setQuizQuestions([])
+    setUserAnswers({})
+    setQuizSubmitted(false)
+    setQuizEvaluation(null)
+    setQuizSessionId("")
+    try {
+      const diffMap: Record<string, QuestionDifficulty> = {
+        Easy: "easy",
+        Medium: "medium",
+        Challenging: "hard",
+      }
+      const res = await generateQuestions(doc.backendDocId, {
+        count: Number(count),
+        types: selectedQTypes,
+        difficulty: diffMap[difficulty] ?? "medium",
+      })
+      setQuizSessionId(res.session_id)
+      setQuizQuestions(res.questions)
+      setGenerated(true)
+    } catch (err: unknown) {
+      const msg =
+        err && typeof err === "object" && "message" in err
+          ? (err as { message: string }).message
+          : "Failed to generate questions from backend."
+      setQuestionsError(msg)
+    } finally {
+      setQuestionsBusy(false)
+    }
+  }
+
+  const handleSubmitQuiz = async () => {
+    if (!doc?.backendDocId || !quizSessionId || quizSubmitted) return
+    const answers: QuestionAnswerSubmission[] = quizQuestions.map((q) => ({
+      question_id: q.question_id,
+      user_answer: userAnswers[q.question_id] ?? "",
+    }))
+    setQuestionsBusy(true)
+    try {
+      const result = await evaluateQuiz(quizSessionId, answers, doc.backendDocId)
+      setQuizEvaluation(result)
+      setQuizSubmitted(true)
+      addActivity(
+        "quiz",
+        "Revision quiz completed",
+        `Scored ${result.percentage}% (${result.correct_count}/${result.total_questions}) on "${doc.name}"`,
+        "cards",
+        "green"
+      )
+    } catch (err: unknown) {
+      const msg =
+        err && typeof err === "object" && "message" in err
+          ? (err as { message: string }).message
+          : "Failed to evaluate quiz."
+      setQuestionsError(msg)
+    } finally {
+      setQuestionsBusy(false)
+    }
+  }
+
+  const handleGenerateSummary = async () => {
+    if (!doc) {
+      setSummaryError("Please upload notes before generating a summary.")
+      return
+    }
+    if (!doc.backendDocId) {
+      setSummaryError(`"${doc.name}" has not yet been indexed in SQLite. Please upload notes first.`)
+      setSummaryResult(null)
+      return
+    }
+
+    setSummaryBusy(true)
+    setSummaryError("")
+    try {
+      const res = await summarizeDocument(doc.backendDocId, summaryMode)
+      setSummaryResult(res)
+      addActivity(
+        "summary",
+        "Summary generated",
+        `Created ${res.summary_mode.replace("_", " ")} summary for "${doc.name}"`,
+        "spark",
+        "peach"
+      )
+    } catch (err: unknown) {
+      const message =
+        err && typeof err === "object" && "message" in err
+          ? (err as { message: string }).message
+          : "Failed to generate summary from the document."
+      setSummaryError(message)
+      setSummaryResult(null)
+    } finally {
+      setSummaryBusy(false)
+    }
+  }
+
+  const ALLOWED_EXTENSIONS = [
+    ".pdf",
+    ".pptx",
+    ".ppt",
+    ".docx",
+    ".doc",
+    ".txt",
+    ".md",
+    ".markdown",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".bmp",
+    ".tiff",
+  ]
   const selectFile = (file?: File) => {
     setUploadError("")
-    if (!file) return
-    if (!file.name.toLowerCase().endsWith(".pdf")) {
-      setUploadError("Please choose a PDF file.")
+    if (!file) {
+      setSelectedFile(null)
+      setUploadName("")
       return
     }
-    if (file.size > 20 * 1024 * 1024) {
-      setUploadError("Please choose a PDF smaller than 20 MB.")
+    const lower = file.name.toLowerCase()
+    const isAllowed = ALLOWED_EXTENSIONS.some((ext) => lower.endsWith(ext))
+    if (!isAllowed) {
+      setSelectedFile(null)
+      setUploadName("")
+      setUploadError(
+        "Supported file formats: PDF (.pdf), PowerPoint (.pptx), Word (.docx), Text (.txt, .md), and Photos/Images (.png, .jpg, .webp)."
+      )
       return
     }
+    if (file.size > 50 * 1024 * 1024) {
+      setSelectedFile(null)
+      setUploadName("")
+      setUploadError("Please choose a file smaller than 50 MB.")
+      return
+    }
+    setSelectedFile(file)
     setUploadName(file.name)
+  }
+
+  const handleUpload = async () => {
+    if (!selectedFile || uploading) return
+    setUploading(true)
+    setUploadError("")
+
+    try {
+      const result = await uploadPDFDocument(selectedFile)
+
+      const sizeStr =
+        selectedFile.size < 1024 * 1024
+          ? `${(selectedFile.size / 1024).toFixed(1)} KB`
+          : `${(selectedFile.size / (1024 * 1024)).toFixed(1)} MB`
+
+      // Generate a client-side session identifier linked to backend document ID
+      const newDocId = Date.now()
+
+      const newDoc: Doc = {
+        id: newDocId,
+        backendDocId: result.document_id,
+        name: result.filename,
+        subject: "Study Notes",
+        size: sizeStr,
+        pages: result.page_count,
+        date: "Just now",
+        color: result.has_extractable_text ? "purple" : "peach",
+        totalCharacters: result.total_characters,
+        totalWords: result.total_words,
+        chunkCount: result.chunk_count,
+        hasExtractableText: result.has_extractable_text,
+        ocrSuggested: result.ocr_suggested,
+        extractedPages: result.pages,
+        statusMessage: result.message,
+      }
+
+      setDocs((prev) => [newDoc, ...prev.filter((d) => d.backendDocId !== newDoc.backendDocId)])
+      setActiveDoc(newDocId)
+      setSelectedFile(null)
+      setUploadName("")
+      setModal(null)
+
+      addActivity(
+        "upload",
+        "Notes added to library",
+        `Uploaded "${newDoc.name}" (${result.page_count} pg, ${result.chunk_count} chunks)`,
+        "file",
+        "purple"
+      )
+
+      if (result.has_extractable_text) {
+        notify(
+          `Extracted ${result.total_words.toLocaleString()} words and indexed ${result.chunk_count} semantic chunks from "${newDoc.name}".`,
+        )
+      } else {
+        notify(
+          `"${newDoc.name}" uploaded, but no extractable text found.`,
+        )
+      }
+    } catch (err: unknown) {
+      const message =
+        err && typeof err === "object" && "message" in err
+          ? (err as { message: string }).message
+          : "Failed to upload and extract text from the document."
+      setUploadError(message)
+    } finally {
+      setUploading(false)
+    }
   }
   const documentSelect = (
     <label className="field">
@@ -338,7 +851,8 @@ export default function App() {
         value={doc?.id || ""}
         onChange={(e) => {
           setActiveDoc(Number(e.target.value))
-          setSummary(false)
+          setSummaryResult(null)
+          setSummaryError("")
           setMessages([])
           setGenerated(false)
           setSaved([])
@@ -347,11 +861,11 @@ export default function App() {
         {docs.length ? (
           docs.map((d) => (
             <option key={d.id} value={d.id}>
-              {d.name}
+              {d.name} {d.backendDocId ? `(Indexed · ${d.pages} pg)` : ""}
             </option>
           ))
         ) : (
-          <option value="">No documents — add a demo PDF first</option>
+          <option value="">No notes uploaded yet</option>
         )}
       </select>
     </label>
@@ -459,7 +973,9 @@ export default function App() {
             <button
               className="nav-cta"
               onClick={() => {
+                setSelectedFile(null)
                 setUploadName("")
+                setUploadError("")
                 setModal("upload")
               }}
             >
@@ -498,7 +1014,9 @@ export default function App() {
                 </div>
                 <Button
                   onClick={() => {
+                    setSelectedFile(null)
                     setUploadName("")
+                    setUploadError("")
                     setModal("upload")
                   }}
                 >
@@ -534,28 +1052,28 @@ export default function App() {
               <div className="stats-grid">
                 {[
                   {
-                    label: "Documents uploaded",
+                    label: "Documents in library",
                     value: String(docs.length).padStart(2, "0"),
                     icon: "file" as IconName,
                     color: "purple",
-                    detail: "Your knowledge, all in one place",
-                    extra: "+2 this week",
+                    detail: docs.length === 1 ? "1 document indexed in SQLite" : `${docs.length} documents indexed in SQLite`,
+                    extra: "Persistent SQLite store",
                   },
                   {
                     label: "Questions asked",
-                    value: "28",
+                    value: String(activities.filter((a) => a.type === "ask").length).padStart(2, "0"),
                     icon: "chat" as IconName,
                     color: "blue",
-                    detail: "One question closer to clarity",
-                    extra: "+8 this week",
+                    detail: "Grounded semantic queries",
+                    extra: "Real-time log",
                   },
                   {
-                    label: "Study sessions",
-                    value: "12",
+                    label: "Study actions",
+                    value: String(activities.length).padStart(2, "0"),
                     icon: "clock" as IconName,
                     color: "peach",
-                    detail: "Small steps. Real progress.",
-                    extra: "Keep it going",
+                    detail: "Uploads, Q&A, and Quizzes",
+                    extra: activities.length > 0 ? "Saved in session" : "Ready to begin",
                   },
                 ].map((s) => (
                   <section className="stat-card" key={s.label}>
@@ -605,19 +1123,24 @@ export default function App() {
                         >
                           <span className={`file-icon ${d.color}`}>
                             <Icon name="file" size={23} />
-                            <small>PDF</small>
+                            <small>{getDocFormat(d.name)}</small>
                           </span>
                           <span className="document-info">
                             <strong>{d.name}</strong>
                             <span>
                               {d.subject}
                               <i /> {d.pages} pages <i /> {d.size}
+                              {d.totalWords ? <> <i /> {d.totalWords.toLocaleString()} words</> : null}
                             </span>
                           </span>
                           <span className="document-end">
                             <span className="ready-badge">
                               <span />
-                              Demo ready
+                              {d.extractedPages
+                                ? d.hasExtractableText
+                                  ? "Text ready"
+                                  : "Needs OCR"
+                                : "Indexed"}
                             </span>
                             <small>{d.date}</small>
                           </span>
@@ -625,11 +1148,25 @@ export default function App() {
                         </button>
                       ))}
                       {!docs.length && (
-                        <div className="empty-state">
-                          <Icon name="file" />
-                          <p>No documents yet. Add your first demo PDF.</p>
-                          <Button onClick={() => setModal("upload")}>
-                            Upload Notes
+                        <div className="empty-state" style={{ padding: "36px 20px", textAlign: "center" }}>
+                          <span className="icon-box purple" style={{ width: "48px", height: "48px", margin: "0 auto 14px", borderRadius: "12px", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                            <Icon name="file" size={26} />
+                          </span>
+                          <h3 style={{ fontSize: "16px", fontWeight: 700, margin: "0 0 6px", color: "#f8fafc" }}>
+                            No notes uploaded yet
+                          </h3>
+                          <p style={{ fontSize: "12.5px", color: "#94a3b8", margin: "0 auto 16px", maxWidth: "340px", lineHeight: "1.6" }}>
+                            Start studying by uploading your notes in any format — PDF, PPT slides, Word documents, text notes, or lecture photos (with OCR).
+                          </p>
+                          <Button
+                            onClick={() => {
+                              setSelectedFile(null)
+                              setUploadName("")
+                              setUploadError("")
+                              setModal("upload")
+                            }}
+                          >
+                            <Icon name="upload" size={16} /> Upload Your First Notes
                           </Button>
                         </div>
                       )}
@@ -667,50 +1204,35 @@ export default function App() {
                     <span className="live-dot" />
                   </div>
                   <div className="activity-list">
-                    {[
-                      {
-                        icon: "chat" as IconName,
-                        color: "purple",
-                        title: "A concept, made clearer",
-                        description: "Asked about normalization in DBMS",
-                        time: "25 minutes ago",
-                      },
-                      {
-                        icon: "spark" as IconName,
-                        color: "blue",
-                        title: "The essentials, at a glance",
-                        description: "Summarized Data Structures notes",
-                        time: "2 hours ago",
-                      },
-                      {
-                        icon: "file" as IconName,
-                        color: "peach",
-                        title: "New knowledge added",
-                        description: "Uploaded DBMS – Unit 3",
-                        time: "3 hours ago",
-                      },
-                      {
-                        icon: "cards" as IconName,
-                        color: "green",
-                        title: "A little revision, a lot of confidence",
-                        description: "Created 10 practice questions",
-                        time: "Yesterday",
-                      },
-                    ].map((a, i) => (
-                      <div className="activity-item" key={a.title}>
-                        <div className="timeline-icon">
-                          <span className={`icon-box ${a.color}`}>
-                            <Icon name={a.icon} size={16} />
-                          </span>
-                          {i < 3 && <i />}
+                    {activities.length > 0 ? (
+                      activities.slice(0, 5).map((a, i) => (
+                        <div className="activity-item" key={a.id || i}>
+                          <div className="timeline-icon">
+                            <span className={`icon-box ${a.color}`}>
+                              <Icon name={a.icon} size={16} />
+                            </span>
+                            {i < Math.min(activities.length, 5) - 1 && <i />}
+                          </div>
+                          <div>
+                            <strong>{a.title}</strong>
+                            <p>{a.description}</p>
+                            <span>{a.time}</span>
+                          </div>
                         </div>
-                        <div>
-                          <strong>{a.title}</strong>
-                          <p>{a.description}</p>
-                          <span>{a.time}</span>
-                        </div>
+                      ))
+                    ) : (
+                      <div className="empty-state" style={{ padding: "28px 14px", textAlign: "center" }}>
+                        <span className="icon-box blue" style={{ width: "40px", height: "40px", margin: "0 auto 10px", borderRadius: "10px", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                          <Icon name="clock" size={20} />
+                        </span>
+                        <strong style={{ display: "block", fontSize: "13px", color: "#f8fafc", marginBottom: "4px" }}>
+                          No recent activity yet
+                        </strong>
+                        <p style={{ fontSize: "11.5px", color: "#94a3b8", margin: 0, lineHeight: "1.5" }}>
+                          When you upload notes, ask questions, or generate revision quizzes, your progress will be tracked here in real-time.
+                        </p>
                       </div>
-                    ))}
+                    )}
                   </div>
                   <div className="activity-footer">
                     <Icon name="book" size={19} />
@@ -722,13 +1244,6 @@ export default function App() {
                   </div>
                 </aside>
               </div>
-              <Pricing
-                onExplore={(plan) =>
-                  notify(
-                    `${plan} is a concept plan. No subscription or payment is activated.`,
-                  )
-                }
-              />
               <Footer onNavigate={go} onHelp={() => setModal("help")} />
             </>
           ) : (
@@ -750,20 +1265,21 @@ export default function App() {
                 {page === "My Documents" && (
                   <Button
                     onClick={() => {
+                      setSelectedFile(null)
                       setUploadName("")
+                      setUploadError("")
                       setModal("upload")
                     }}
                   >
                     <Icon name="upload" size={18} />
-                    Upload PDF
+                    Upload Notes
                   </Button>
                 )}
               </div>
               <div className="demo-notice">
                 <Icon name="spark" size={17} />
                 <span>
-                  Interactive prototype · Documents and AI content are samples.
-                  No files are processed or stored.
+                  Universal Study Workspace · Real multi-format text extraction (PDF, PPT, Word, TXT, OCR) & persistent SQLite store.
                 </span>
               </div>
               {page === "My Documents" && (
@@ -771,7 +1287,9 @@ export default function App() {
                   <button
                     className="dropzone"
                     onClick={() => {
+                      setSelectedFile(null)
                       setUploadName("")
+                      setUploadError("")
                       setModal("upload")
                     }}
                     onDragOver={(e) => e.preventDefault()}
@@ -786,9 +1304,9 @@ export default function App() {
                     </span>
                     <strong>Give your notes a home</strong>
                     <p>
-                      Drag and drop a PDF, or <span>browse files</span>
+                      Drag and drop any study notes, or <span>browse files</span>
                     </p>
-                    <small>PDF files only · Up to 20 MB · Demo upload</small>
+                    <small>PDF, PPTX, Word DOCX, TXT, or Photos (OCR) · Up to 50 MB</small>
                   </button>
                   <div className="document-toolbar">
                     <div className="search-input">
@@ -813,7 +1331,7 @@ export default function App() {
                       )}
                     </select>
                     <select aria-label="Filter by file type">
-                      <option>PDF files</option>
+                      <option>All file formats</option>
                     </select>
                     <span>{docs.length} documents</span>
                   </div>
@@ -829,11 +1347,15 @@ export default function App() {
                           <div className="library-card-top">
                             <span className={`file-icon ${d.color}`}>
                               <Icon name="file" size={25} />
-                              <small>PDF</small>
+                              <small>{getDocFormat(d.name)}</small>
                             </span>
                             <span className="ready-badge">
                               <span />
-                              Demo ready
+                              {d.extractedPages
+                                ? d.hasExtractableText
+                                  ? "Text extracted"
+                                  : "Needs OCR"
+                                : "Indexed"}
                             </span>
                           </div>
                           <h2>{d.name}</h2>
@@ -843,6 +1365,7 @@ export default function App() {
                           <p>
                             {d.pages ? `${d.pages} pages · ` : ""}
                             {d.size}
+                            {d.totalWords ? ` · ${d.totalWords.toLocaleString()} words` : ""}
                             <span>{d.date}</span>
                           </p>
                           <div className="library-actions">
@@ -871,15 +1394,37 @@ export default function App() {
                         </section>
                       ))}
                   </div>
-                  {!docs.filter(
+                  {docs.length === 0 ? (
+                    <div className="empty-state panel" style={{ padding: "48px 24px", textAlign: "center" }}>
+                      <span className="icon-box purple" style={{ width: "56px", height: "56px", margin: "0 auto 16px", borderRadius: "14px", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                        <Icon name="file" size={30} />
+                      </span>
+                      <h2 style={{ fontSize: "18px", fontWeight: 700, margin: "0 0 8px", color: "#f8fafc" }}>
+                        Your notes library is empty
+                      </h2>
+                      <p style={{ fontSize: "13px", color: "#94a3b8", margin: "0 auto 20px", maxWidth: "420px", lineHeight: "1.6" }}>
+                        No mock data. Upload your real academic notes (PDF, PowerPoint slides, Word documents, text notes, or lecture photos). All extracted content and embeddings are securely saved to the persistent database.
+                      </p>
+                      <Button
+                        onClick={() => {
+                          setSelectedFile(null)
+                          setUploadName("")
+                          setUploadError("")
+                          setModal("upload")
+                        }}
+                      >
+                        <Icon name="upload" size={17} /> Upload Notes Now
+                      </Button>
+                    </div>
+                  ) : !docs.filter(
                     (d) =>
                       d.name.toLowerCase().includes(search.toLowerCase()) &&
                       (subject === "All subjects" || d.subject === subject),
-                  ).length && (
+                  ).length ? (
                     <div className="empty-state panel">
                       <Icon name="search" size={28} />
-                      <h2>No documents found</h2>
-                      <p>Try a different search or add a demo PDF.</p>
+                      <h2>No matching documents found</h2>
+                      <p>Try a different search keyword or subject filter.</p>
                       <Button
                         variant="secondary"
                         onClick={() => {
@@ -890,10 +1435,33 @@ export default function App() {
                         Clear filters
                       </Button>
                     </div>
-                  )}
+                  ) : null}
                 </>
               )}
               {page === "Ask Your Notes" && (
+                docs.length === 0 ? (
+                  <section className="panel empty-state" style={{ padding: "56px 24px", textAlign: "center", minHeight: "380px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+                    <span className="icon-box purple" style={{ width: "56px", height: "56px", margin: "0 auto 16px", borderRadius: "14px", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      <Icon name="chat" size={30} />
+                    </span>
+                    <h2 style={{ fontSize: "19px", fontWeight: 700, margin: "0 0 8px", color: "#f8fafc" }}>
+                      Upload notes to start asking questions
+                    </h2>
+                    <p style={{ fontSize: "13.5px", color: "#94a3b8", margin: "0 auto 22px", maxWidth: "440px", lineHeight: "1.6" }}>
+                      StudySphere AI answers are strictly grounded in your notes using semantic retrieval. Upload a PDF, PPT, Word doc, or photo to start asking questions!
+                    </p>
+                    <Button
+                      onClick={() => {
+                        setSelectedFile(null)
+                        setUploadName("")
+                        setUploadError("")
+                        setModal("upload")
+                      }}
+                    >
+                      <Icon name="upload" size={17} /> Upload Notes
+                    </Button>
+                  </section>
+                ) : (
                 <section className="panel conversation-panel">
                   <div className="conversation-header">
                     {documentSelect}
@@ -952,24 +1520,115 @@ export default function App() {
                             <div>
                               <strong>
                                 StudySphere AI{" "}
-                                <span className="sample-tag">
-                                  Sample response
+                                <span className="sample-tag" style={{ marginLeft: "8px" }}>
+                                  {m.retrieval_status === "insufficient_evidence"
+                                    ? "Insufficient Evidence"
+                                    : m.generation_provider === "google_gemini"
+                                    ? "Gemini Flash Grounded"
+                                    : m.generation_provider === "local_ollama"
+                                    ? "Local Ollama Grounded"
+                                    : m.generation_provider === "extractive_grounded_synthesizer"
+                                    ? "Structured Grounded Synthesis (Notes)"
+                                    : "RAG Grounded Response"}
                                 </span>
                               </strong>
-                              <p>{m.answer}</p>
-                              <div className="sources">
-                                <span>
-                                  SOURCES · ILLUSTRATIVE, NOT VERIFIED
-                                </span>
-                                <p>
-                                  <Icon name="file" size={15} />
-                                  {doc?.name} · Example: page 8
-                                </p>
-                                <small>
-                                  This is a prewritten demo answer, not a
-                                  response retrieved from your PDF.
-                                </small>
+                              <div style={{ marginTop: "10px" }}>
+                                <FormattedAnswer text={m.answer} />
                               </div>
+                              {((m.cited_sources && m.cited_sources.length > 0) || (m.sources && m.sources.length > 0)) && (
+                                <div className="sources" style={{ marginTop: "18px" }}>
+                                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+                                    <span style={{ fontWeight: 700, letterSpacing: "0.8px", textTransform: "uppercase", fontSize: "9.5px", color: "#c4b5fd" }}>
+                                      EVIDENCE CITED IN ANSWER ({(m.cited_sources || m.sources || []).length} PASSAGE{(m.cited_sources || m.sources || []).length === 1 ? "" : "S"})
+                                    </span>
+                                    <small style={{ fontSize: "8.5px", color: "#94a3b8" }}>
+                                      Scores indicate semantic similarity, not accuracy confidence
+                                    </small>
+                                  </div>
+                                  <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                                    {(m.cited_sources || m.sources || []).map((s, sIdx) => (
+                                      <div
+                                        key={sIdx}
+                                        className="source-item-card"
+                                        style={{
+                                          padding: "12px 14px",
+                                          background: "rgba(21, 30, 58, 0.75)",
+                                          border: "1px solid rgba(139, 92, 246, 0.25)",
+                                          borderRadius: "10px",
+                                        }}
+                                      >
+                                        <p style={{ margin: 0, fontWeight: 650, fontSize: "12px", display: "flex", alignItems: "center", gap: "7px", color: "#c4b5fd" }}>
+                                          <Icon name="file" size={15} />
+                                          {s.document_name} · Page {s.page_number} · Semantic similarity: {s.similarity_score.toFixed(2)}
+                                        </p>
+                                        <small style={{ display: "block", marginTop: "6px", fontStyle: "italic", color: "#cbd5e1", lineHeight: 1.65, fontSize: "12px" }}>
+                                          "{s.excerpt.length > 220 ? s.excerpt.slice(0, 220) + "..." : s.excerpt}"
+                                        </small>
+                                      </div>
+                                    ))}
+                                  </div>
+
+                                  {/* Optional transparency view for remaining candidate passages */}
+                                  {m.retrieved_sources && m.retrieved_sources.length > (m.cited_sources?.length || m.sources?.length || 0) && (
+                                    <div style={{ marginTop: "12px", borderTop: "1px dashed rgba(139, 92, 246, 0.25)", paddingTop: "10px" }}>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setExpandedRetrievals((prev) =>
+                                            prev.includes(i) ? prev.filter((id) => id !== i) : [...prev, i]
+                                          )
+                                        }}
+                                        style={{
+                                          background: "none",
+                                          border: "0",
+                                          color: "#a78bfa",
+                                          fontSize: "11px",
+                                          fontWeight: 600,
+                                          display: "flex",
+                                          alignItems: "center",
+                                          gap: "6px",
+                                          padding: "4px 0",
+                                          cursor: "pointer",
+                                        }}
+                                      >
+                                        <Icon name={expandedRetrievals.includes(i) ? "close" : "search"} size={13} />
+                                        {expandedRetrievals.includes(i)
+                                          ? "Hide candidate search passages"
+                                          : `Inspect ${m.retrieved_sources.length - (m.cited_sources?.length || m.sources?.length || 0)} other retrieved candidate passage(s)`}
+                                      </button>
+                                      {expandedRetrievals.includes(i) && (
+                                        <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginTop: "10px" }}>
+                                          {m.retrieved_sources
+                                            .filter(
+                                              (rs) =>
+                                                !(m.cited_sources || m.sources || []).some(
+                                                  (cs) => cs.chunk_index === rs.chunk_index && cs.page_number === rs.page_number
+                                                )
+                                            )
+                                            .map((rs, rsIdx) => (
+                                              <div
+                                                key={rsIdx}
+                                                style={{
+                                                  padding: "10px 12px",
+                                                  background: "rgba(15, 23, 42, 0.65)",
+                                                  border: "1px solid rgba(148, 163, 184, 0.15)",
+                                                  borderRadius: "8px",
+                                                }}
+                                              >
+                                                <p style={{ margin: 0, fontSize: "11px", color: "#a5b4fc", fontWeight: 600 }}>
+                                                  Candidate: {rs.document_name} · Page {rs.page_number} · Similarity: {rs.similarity_score.toFixed(2)} (Not cited in answer)
+                                                </p>
+                                                <small style={{ display: "block", marginTop: "4px", color: "#94a3b8", fontSize: "11px", lineHeight: 1.5 }}>
+                                                  "{rs.excerpt.slice(0, 160)}..."
+                                                </small>
+                                              </div>
+                                            ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
                             </div>
                           </div>
                         </div>
@@ -978,7 +1637,7 @@ export default function App() {
                     {busy && (
                       <div className="loading-state">
                         <span className="spinner" />
-                        Preparing a sample explanation…
+                        Retrieving semantic document chunks and synthesizing answer…
                       </div>
                     )}
                   </div>
@@ -996,8 +1655,8 @@ export default function App() {
                         onChange={(e) => setQuestion(e.target.value)}
                         placeholder={
                           doc
-                            ? "What would you like to understand about your notes?"
-                            : "Add a demo document to get started"
+                            ? `Ask a question about ${doc.name}…`
+                            : "Select a document to ask questions"
                         }
                         disabled={!doc}
                         onKeyDown={(e) => {
@@ -1015,13 +1674,35 @@ export default function App() {
                       </button>
                     </div>
                     <p>
-                      <Icon name="help" size={13} /> Demo answers may not match
-                      your document. Always check your original notes.
+                      <Icon name="spark" size={13} /> Answers are strictly grounded in your selected notes using dense semantic retrieval.
                     </p>
                   </form>
                 </section>
-              )}
+              ))}
               {page === "AI Summarizer" && (
+                docs.length === 0 ? (
+                  <section className="panel empty-state" style={{ padding: "56px 24px", textAlign: "center", minHeight: "380px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+                    <span className="icon-box blue" style={{ width: "56px", height: "56px", margin: "0 auto 16px", borderRadius: "14px", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      <Icon name="spark" size={30} />
+                    </span>
+                    <h2 style={{ fontSize: "19px", fontWeight: 700, margin: "0 0 8px", color: "#f8fafc" }}>
+                      Upload notes to generate summaries
+                    </h2>
+                    <p style={{ fontSize: "13.5px", color: "#94a3b8", margin: "0 auto 22px", maxWidth: "440px", lineHeight: "1.6" }}>
+                      Choose your study material to generate concise overviews, detailed breakdowns, bullet key points, or topic-wise summaries without hallucinations.
+                    </p>
+                    <Button
+                      onClick={() => {
+                        setSelectedFile(null)
+                        setUploadName("")
+                        setUploadError("")
+                        setModal("upload")
+                      }}
+                    >
+                      <Icon name="upload" size={17} /> Upload Notes
+                    </Button>
+                  </section>
+                ) : (
                 <div className="tool-layout">
                   <section className="panel configuration-panel">
                     <span className="icon-box blue">
@@ -1030,120 +1711,388 @@ export default function App() {
                     <h2>Your notes, distilled.</h2>
                     <p>Choose your material and how much detail you need.</p>
                     {documentSelect}
-                    <label className="field">Summary length</label>
-                    <div className="segmented">
-                      {["Short", "Medium", "Detailed"].map((l) => (
+                    <label className="field">Summary mode</label>
+                    <div
+                      className="segmented"
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(4, 1fr)",
+                        gap: "2px",
+                      }}
+                    >
+                      {(
+                        [
+                          { id: "short" as SummaryMode, label: "Short" },
+                          { id: "detailed" as SummaryMode, label: "Detailed" },
+                          { id: "key_points" as SummaryMode, label: "Key Points" },
+                          { id: "topic_wise" as SummaryMode, label: "Topic Wise" },
+                        ] as const
+                      ).map((m) => (
                         <button
-                          key={l}
-                          className={length === l ? "selected" : ""}
+                          key={m.id}
+                          className={summaryMode === m.id ? "selected" : ""}
                           onClick={() => {
-                            setLength(l)
-                            setSummary(false)
+                            setSummaryMode(m.id)
+                            setSummaryResult(null)
+                            setSummaryError("")
                           }}
                         >
-                          {l}
+                          {m.label}
                         </button>
                       ))}
                     </div>
                     <p className="field-hint">
-                      {length === "Short"
-                        ? "A quick overview of the essentials."
-                        : length === "Medium"
-                          ? "Key concepts with a little context."
-                          : "A deeper breakdown with examples."}
+                      {summaryMode === "short"
+                        ? "A concise executive overview of core essentials."
+                        : summaryMode === "detailed"
+                          ? "Deep structured breakdown by section with definitions & mechanics."
+                          : summaryMode === "key_points"
+                            ? "High-yield bullet takeaways optimized for fast exam revision."
+                            : "Modular structured breakdown organized by distinct topics."}
                     </p>
                     <Button
-                      disabled={busy || !doc}
-                      onClick={() => simulate(() => setSummary(true))}
+                      disabled={summaryBusy || !doc}
+                      onClick={handleGenerateSummary}
                     >
-                      {busy ? (
+                      {summaryBusy ? (
                         <span className="spinner" />
                       ) : (
                         <Icon name="spark" size={17} />
                       )}{" "}
-                      {busy ? "Preparing sample…" : "Generate sample summary"}
+                      {summaryBusy ? "Generating summary…" : "Generate AI Summary"}
                     </Button>
+                    {!doc?.backendDocId && (
+                      <p
+                        style={{
+                          fontSize: "9px",
+                          color: "#9f8eb2",
+                          marginTop: "10px",
+                          lineHeight: "1.5",
+                        }}
+                      >
+                        Note: Select an uploaded PDF with indexed chunks from the dropdown above for real AI summarization.
+                      </p>
+                    )}
                   </section>
                   <section className="panel output-panel">
-                    {summary ? (
+                    {summaryBusy ? (
+                      <div
+                        className="loading-state"
+                        style={{
+                          minHeight: "360px",
+                          display: "flex",
+                          flexDirection: "column",
+                          justifyContent: "center",
+                          alignItems: "center",
+                          gap: "12px",
+                          textAlign: "center",
+                        }}
+                      >
+                        <span
+                          className="spinner"
+                          style={{ width: "24px", height: "24px" }}
+                        />
+                        <strong
+                          style={{
+                            fontSize: "13px",
+                            color: "var(--indigo)",
+                          }}
+                        >
+                          Analyzing document sections & synthesizing grounded summary…
+                        </strong>
+                        <p
+                          style={{
+                            fontSize: "11px",
+                            color: "#8d7f9d",
+                            margin: 0,
+                          }}
+                        >
+                          Strictly extracting factual propositions from{" "}
+                          <strong>{doc?.name}</strong>.
+                        </p>
+                      </div>
+                    ) : summaryError ? (
+                      <div
+                        style={{
+                          padding: "24px",
+                          background: "rgba(255, 235, 238, 0.7)",
+                          border: "1px solid #ffcdd2",
+                          borderRadius: "10px",
+                          color: "#b71c1c",
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "8px",
+                            fontWeight: 650,
+                            fontSize: "13px",
+                            marginBottom: "8px",
+                          }}
+                        >
+                          <Icon name="close" size={18} />
+                          <span>Summarization Notice</span>
+                        </div>
+                        <p
+                          style={{
+                            fontSize: "12px",
+                            lineHeight: "1.7",
+                            margin: "0 0 16px 0",
+                            color: "#5d1515",
+                          }}
+                        >
+                          {summaryError}
+                        </p>
+                        {summaryError.includes("OCR") && (
+                          <div
+                            style={{
+                              fontSize: "11px",
+                              color: "#491212",
+                              background: "white",
+                              padding: "10px 14px",
+                              borderRadius: "6px",
+                              marginBottom: "16px",
+                              border: "1px solid #ffcdd2",
+                            }}
+                          >
+                            <strong>Optical Character Recognition (OCR) Notice:</strong> This document contains scanned raster images without a readable text layer. OCR text extraction is planned for a future phase.
+                          </div>
+                        )}
+                        <Button
+                          variant="secondary"
+                          onClick={handleGenerateSummary}
+                        >
+                          Try Again
+                        </Button>
+                      </div>
+                    ) : summaryResult ? (
                       <>
-                        <div className="section-heading">
-                          <span className="sample-tag">
-                            {length} · Sample summary
-                          </span>
+                        <div
+                          className="section-heading"
+                          style={{ flexWrap: "wrap", gap: "10px" }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "8px",
+                              flexWrap: "wrap",
+                            }}
+                          >
+                            <span
+                              className="sample-tag"
+                              style={{
+                                background: "rgba(103, 58, 183, 0.12)",
+                                color: "var(--indigo)",
+                                fontWeight: 600,
+                              }}
+                            >
+                              {summaryResult.summary_mode.replace("_", " ").toUpperCase()} MODE
+                            </span>
+                            <span
+                              style={{
+                                fontSize: "10px",
+                                color: "#77658c",
+                                background: "#f5f1fa",
+                                padding: "3px 8px",
+                                borderRadius: "4px",
+                                border: "1px solid #eae2f3",
+                              }}
+                            >
+                              {summaryResult.generation_provider === "extractive_grounded_summarizer"
+                                ? "Offline Grounded Synthesizer"
+                                : summaryResult.generation_provider}
+                            </span>
+                            {summaryResult.cited_pages && summaryResult.cited_pages.length > 0 && (
+                              <span
+                                style={{
+                                  fontSize: "10px",
+                                  color: "#695383",
+                                  background: "#f0ebf8",
+                                  padding: "3px 8px",
+                                  borderRadius: "4px",
+                                  border: "1px solid #e5daf0",
+                                }}
+                              >
+                                Pages Cited: {summaryResult.cited_pages.join(", ")}
+                              </span>
+                            )}
+                          </div>
                           <button
                             className="text-button"
                             onClick={() => {
                               navigator.clipboard
-                                ?.writeText(
-                                  "Database normalization: organize data to reduce redundancy. 1NF: atomic values. 2NF: no partial dependencies. 3NF: no transitive dependencies.",
-                                )
-                                .then(() => notify("Sample summary copied."))
+                                ?.writeText(summaryResult.summary)
+                                .then(() => notify("Summary copied to clipboard."))
                                 .catch(() =>
-                                  notify(
-                                    "Copy is unavailable in this browser.",
-                                  ),
+                                  notify("Copy is unavailable in this browser.")
                                 )
                             }}
                           >
-                            Copy summary
+                            <Icon name="cards" size={14} /> Copy summary
                           </button>
                         </div>
-                        <h2>{doc?.name}</h2>
-                        <p className="output-intro">
-                          This illustrative summary demonstrates the output
-                          layout; it is not extracted from the selected
-                          document.
-                        </p>
-                        <h3>The big picture</h3>
-                        <p>
-                          Database normalization is a systematic approach to
-                          organizing relational data. It reduces redundancy and
-                          prevents insertion, update, and deletion anomalies.
-                        </p>
-                        <h3>Key takeaways</h3>
-                        <ul>
-                          <li>
-                            <strong>First Normal Form (1NF):</strong> Each field
-                            contains a single, atomic value.
-                          </li>
-                          {length !== "Short" && (
-                            <>
-                              <li>
-                                <strong>Second Normal Form (2NF):</strong> Every
-                                non-key attribute depends on the entire primary
-                                key.
-                              </li>
-                              <li>
-                                <strong>Third Normal Form (3NF):</strong> Remove
-                                transitive dependencies between non-key
-                                attributes.
-                              </li>
-                            </>
-                          )}
-                        </ul>
-                        {length === "Detailed" && (
-                          <>
-                            <h3>A simple example</h3>
-                            <p>
-                              Separate student information and department
-                              information into two tables. A department ID
-                              connects them, so department details only need to
-                              be updated once.
-                            </p>
-                            <h3>Remember this</h3>
-                            <p>
-                              Normalization is about giving each fact one clear
-                              home. Balance structure with your application’s
-                              query needs.
-                            </p>
-                          </>
+
+                        <h2>{summaryResult.document_name}</h2>
+
+                        {summaryResult.warning && (
+                          <div
+                            style={{
+                              padding: "9px 13px",
+                              background: "rgba(244, 240, 252, 0.8)",
+                              border: "1px solid #e4d8f3",
+                              borderRadius: "7px",
+                              fontSize: "10.5px",
+                              color: "#6e598f",
+                              margin: "10px 0 18px",
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "8px",
+                            }}
+                          >
+                            <Icon name="spark" size={15} />
+                            <span>{summaryResult.warning}</span>
+                          </div>
                         )}
+
+                        {/* Structured Topic Sections if topic_wise */}
+                        {summaryResult.topic_sections && summaryResult.topic_sections.length > 0 ? (
+                          <div
+                            style={{
+                              display: "flex",
+                              flexDirection: "column",
+                              gap: "16px",
+                              marginTop: "14px",
+                            }}
+                          >
+                            {summaryResult.topic_sections.map((topic, tIdx) => (
+                              <div
+                                key={tIdx}
+                                style={{
+                                  padding: "16px 18px",
+                                  background: "rgba(253, 252, 255, 0.75)",
+                                  border: "1px solid #ebe4f3",
+                                  borderRadius: "8px",
+                                  boxShadow: "0 2px 6px rgba(110, 80, 160, 0.03)",
+                                }}
+                              >
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    justifyContent: "space-between",
+                                    alignItems: "center",
+                                    marginBottom: "8px",
+                                  }}
+                                >
+                                  <h3
+                                    style={{
+                                      margin: 0,
+                                      fontSize: "13.5px",
+                                      fontWeight: 700,
+                                      color: "var(--indigo)",
+                                    }}
+                                  >
+                                    {topic.title}
+                                  </h3>
+                                  <span
+                                    style={{
+                                      fontSize: "9.5px",
+                                      color: "#8a75a7",
+                                      background: "#f3eef9",
+                                      padding: "2px 7px",
+                                      borderRadius: "4px",
+                                    }}
+                                  >
+                                    Page(s) {topic.page_numbers.join(", ")}
+                                  </span>
+                                </div>
+                                <p
+                                  style={{
+                                    fontSize: "12px",
+                                    lineHeight: "1.75",
+                                    color: "#4f4559",
+                                    margin: "0 0 10px 0",
+                                  }}
+                                >
+                                  {topic.content}
+                                </p>
+                                {topic.key_points && topic.key_points.length > 0 && (
+                                  <ul
+                                    style={{
+                                      margin: "6px 0 0 0",
+                                      paddingLeft: "18px",
+                                      fontSize: "11.5px",
+                                      color: "#5d4e70",
+                                      lineHeight: "1.7",
+                                    }}
+                                  >
+                                    {topic.key_points.map((pt, ptIdx) => (
+                                      <li
+                                        key={ptIdx}
+                                        style={{ marginBottom: "4px" }}
+                                      >
+                                        {pt}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          /* Render markdown for short, detailed, and key_points */
+                          <div style={{ marginTop: "12px" }}>
+                            <FormattedAnswer text={summaryResult.summary} />
+                          </div>
+                        )}
+
+                        {/* Key Points standalone card list if key_points returned and not topic_wise */}
+                        {!summaryResult.topic_sections && summaryResult.key_points && summaryResult.key_points.length > 0 && summaryMode !== "key_points" && (
+                          <div
+                            style={{
+                              marginTop: "20px",
+                              padding: "16px",
+                              background: "rgba(247, 244, 253, 0.65)",
+                              border: "1px solid #eee5f7",
+                              borderRadius: "8px",
+                            }}
+                          >
+                            <h4
+                              style={{
+                                margin: "0 0 10px 0",
+                                fontSize: "12px",
+                                fontWeight: 700,
+                                color: "var(--indigo)",
+                              }}
+                            >
+                              Core Bullet Takeaways
+                            </h4>
+                            <ul
+                              style={{
+                                margin: 0,
+                                paddingLeft: "18px",
+                                fontSize: "11.5px",
+                                color: "#544665",
+                                lineHeight: "1.7",
+                              }}
+                            >
+                              {summaryResult.key_points.map((kp, kpIdx) => (
+                                <li
+                                  key={kpIdx}
+                                  style={{ marginBottom: "5px" }}
+                                >
+                                  {kp}
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+
                         <div className="summary-takeaway">
                           <Icon name="spark" size={20} />
                           <p>
-                            One fact, one place. That’s the heart of good
-                            database design.
+                            Summary strictly grounded in <strong>{summaryResult.document_name}</strong> across {summaryResult.cited_pages.length} source page(s). All facts and terms originate directly from your notes.
                           </p>
                         </div>
                       </>
@@ -1154,27 +2103,91 @@ export default function App() {
                         </span>
                         <h2>The big ideas belong here.</h2>
                         <p>
-                          Select your notes and generate a sample summary
+                          Select an uploaded PDF and choose a summary mode
                           <br />
-                          to see a clearer, simpler view.
+                          to generate a grounded, hallucination-free breakdown.
                         </p>
                       </div>
                     )}
                   </section>
                 </div>
-              )}
+              ))}
               {page === "Revision Questions" && (
+                docs.length === 0 ? (
+                  <section className="panel empty-state" style={{ padding: "56px 24px", textAlign: "center", minHeight: "380px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+                    <span className="icon-box green" style={{ width: "56px", height: "56px", margin: "0 auto 16px", borderRadius: "14px", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      <Icon name="cards" size={30} />
+                    </span>
+                    <h2 style={{ fontSize: "19px", fontWeight: 700, margin: "0 0 8px", color: "#f8fafc" }}>
+                      Upload notes to generate revision quizzes
+                    </h2>
+                    <p style={{ fontSize: "13.5px", color: "#94a3b8", margin: "0 auto 22px", maxWidth: "440px", lineHeight: "1.6" }}>
+                      Automatically generate MCQs, True/False, short-answer, and long-answer questions grounded directly in your uploaded notes.
+                    </p>
+                    <Button
+                      onClick={() => {
+                        setSelectedFile(null)
+                        setUploadName("")
+                        setUploadError("")
+                        setModal("upload")
+                      }}
+                    >
+                      <Icon name="upload" size={17} /> Upload Notes
+                    </Button>
+                  </section>
+                ) : (
                 <>
+                  {/* ── Configuration panel ─────────────────────────────── */}
                   <section className="panel revision-config">
                     <div>
                       {documentSelect}
+                      {/* Question type chips */}
                       <label className="field">
-                        Chapter
-                        <select>
-                          <option>All chapters</option>
-                          <option>Chapter 1 · Foundations</option>
-                          <option>Chapter 3 · Normalization</option>
-                        </select>
+                        Question types
+                        <div style={{ display: "flex", gap: "7px", flexWrap: "wrap", marginTop: "2px" }}>
+                          {(
+                            [
+                              { id: "mcq" as QuestionType, label: "Multiple Choice" },
+                              { id: "true_false" as QuestionType, label: "True / False" },
+                              { id: "short_answer" as QuestionType, label: "Short Answer" },
+                              { id: "long_answer" as QuestionType, label: "Long Answer" },
+                            ] as const
+                          ).map((qt) => {
+                            const active = selectedQTypes.includes(qt.id)
+                            return (
+                              <button
+                                key={qt.id}
+                                type="button"
+                                onClick={() => {
+                                  setSelectedQTypes((prev) =>
+                                    active
+                                      ? prev.length > 1
+                                        ? prev.filter((t) => t !== qt.id)
+                                        : prev
+                                      : [...prev, qt.id]
+                                  )
+                                  setGenerated(false)
+                                  setQuizQuestions([])
+                                  setQuizSubmitted(false)
+                                  setQuizEvaluation(null)
+                                }}
+                                style={{
+                                  fontSize: "10px",
+                                  padding: "6px 11px",
+                                  borderRadius: "6px",
+                                  border: `1px solid ${active ? "var(--indigo)" : "#e0d9ec"}`,
+                                  background: active ? "var(--indigo)" : "#faf7fd",
+                                  color: active ? "#fff" : "#8a7aa3",
+                                  fontWeight: active ? 600 : 400,
+                                  cursor: "pointer",
+                                  transition: "all .16s",
+                                }}
+                              >
+                                {qt.label}
+                              </button>
+                            )
+                          })}
+                        </div>
                       </label>
                       <label className="field">
                         Questions
@@ -1206,207 +2219,505 @@ export default function App() {
                       </label>
                     </div>
                     <Button
-                      disabled={busy || !doc}
-                      onClick={() => {
-                        setExpanded([])
-                        setSaved([])
-                        setSavedOnly(false)
-                        simulate(() => setGenerated(true))
-                      }}
+                      disabled={questionsBusy || !doc}
+                      onClick={handleGenerateQuestions}
                     >
-                      {busy ? (
+                      {questionsBusy ? (
                         <span className="spinner" />
                       ) : (
                         <Icon name="spark" size={17} />
                       )}{" "}
-                      {busy ? "Creating samples…" : "Generate sample questions"}
+                      {questionsBusy ? "Generating quiz…" : "Generate Quiz"}
                     </Button>
+                    {questionsError && (
+                      <p
+                        style={{
+                          fontSize: "10px",
+                          color: "#b46f7a",
+                          marginTop: "10px",
+                          lineHeight: "1.6",
+                        }}
+                      >
+                        {questionsError}
+                      </p>
+                    )}
+                    {!doc?.backendDocId && (
+                      <p
+                        style={{
+                          fontSize: "9px",
+                          color: "#9f8eb2",
+                          marginTop: "10px",
+                          lineHeight: "1.5",
+                        }}
+                      >
+                        Select an uploaded PDF with indexed chunks for real question generation.
+                      </p>
+                    )}
                   </section>
-                  <div className="revision-toolbar">
-                    <div className="tabs">
-                      {["Multiple Choice", "Short Answer", "Long Answer"].map(
-                        (t) => (
-                          <button
-                            key={t}
-                            className={tab === t ? "selected" : ""}
-                            onClick={() => {
-                              setTab(t)
-                              setExpanded([])
+
+                  {/* ── Score card (after submission) ──────────────────── */}
+                  {quizSubmitted && quizEvaluation && (
+                    <section
+                      className="panel"
+                      style={{ padding: "24px", marginBottom: "0" }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "22px",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        {/* Big score circle */}
+                        <div
+                          style={{
+                            width: "88px",
+                            height: "88px",
+                            borderRadius: "50%",
+                            background:
+                              quizEvaluation.percentage >= 70
+                                ? "linear-gradient(135deg,#6fba8c,#4fa87a)"
+                                : quizEvaluation.percentage >= 40
+                                ? "linear-gradient(135deg,#e8a254,#d68538)"
+                                : "linear-gradient(135deg,#c97070,#b85555)",
+                            display: "grid",
+                            placeItems: "center",
+                            color: "white",
+                            flexShrink: 0,
+                            boxShadow: "0 4px 14px rgba(0,0,0,.12)",
+                          }}
+                        >
+                          <span
+                            style={{
+                              fontFamily: "'Inter',sans-serif",
+                              fontSize: "22px",
+                              fontWeight: 700,
+                              lineHeight: 1,
                             }}
                           >
-                            {t}
+                            {Math.round(quizEvaluation.percentage)}%
+                          </span>
+                        </div>
+                        <div style={{ flex: 1 }}>
+                          <div
+                            style={{
+                              fontFamily: "'Inter',sans-serif",
+                              fontSize: "18px",
+                              fontWeight: 700,
+                              letterSpacing: "-.4px",
+                              color: "#3d3348",
+                              marginBottom: "4px",
+                            }}
+                          >
+                            {quizEvaluation.percentage >= 80
+                              ? "Excellent work! 🎉"
+                              : quizEvaluation.percentage >= 60
+                              ? "Good effort — keep going!"
+                              : "Needs more revision — you've got this!"}
+                          </div>
+                          <p style={{ fontSize: "11px", color: "#9880aa", margin: 0 }}>
+                            {quizEvaluation.correct_count} / {quizEvaluation.total_questions} correct
+                            &nbsp;·&nbsp; Score: {quizEvaluation.total_score.toFixed(1)} / {quizEvaluation.max_score.toFixed(1)}
+                            &nbsp;·&nbsp; Grading: {quizEvaluation.grading_method.replace(/_/g, " ")}
+                          </p>
+                        </div>
+                        <div style={{ display: "flex", gap: "10px", flexShrink: 0 }}>
+                          <button
+                            className="button secondary"
+                            style={{ fontSize: "10px" }}
+                            onClick={() => {
+                              setUserAnswers({})
+                              setQuizSubmitted(false)
+                              setQuizEvaluation(null)
+                            }}
+                          >
+                            <Icon name="clock" size={15} /> Retake
                           </button>
-                        ),
-                      )}
-                    </div>
-                    <button
-                      className={`text-button ${savedOnly ? "selected" : ""}`}
-                      onClick={() => setSavedOnly(!savedOnly)}
-                    >
-                      {savedOnly
-                        ? "Show all samples"
-                        : `Saved this session (${saved.length})`}
-                    </button>
-                  </div>
-                  {generated ? (
+                          <button
+                            className="button"
+                            style={{ fontSize: "10px" }}
+                            onClick={() => {
+                              setQuizQuestions([])
+                              setUserAnswers({})
+                              setQuizSubmitted(false)
+                              setQuizEvaluation(null)
+                              setQuizSessionId("")
+                              setGenerated(false)
+                            }}
+                          >
+                            <Icon name="spark" size={15} /> New Quiz
+                          </button>
+                        </div>
+                      </div>
+                    </section>
+                  )}
+
+                  {/* ── Questions list ──────────────────────────────────── */}
+                  {quizQuestions.length > 0 ? (
                     <div className="questions-list">
                       <div className="questions-caption">
                         <span className="sample-tag">
-                          Generated sample questions
+                          <Icon name="spark" size={12} />
+                          &nbsp;Grounded questions · offline NLP
                         </span>
                         <span>
-                          {difficulty} difficulty · {doc?.name}
+                          {difficulty} · {quizQuestions.length} questions · {doc?.name}
                         </span>
                       </div>
-                      {Array.from({ length: Number(count) }, (_, i) => i)
-                        .filter((i) => !savedOnly || saved.includes(i))
-                        .map((i) => (
-                          <section className="panel question-card" key={i}>
+
+                      {quizQuestions.map((q, idx) => {
+                        const evalResult = quizEvaluation?.evaluations.find(
+                          (e) => e.question_id === q.question_id
+                        )
+                        const isCorrect = evalResult ? evalResult.score >= 0.5 : null
+                        const typeLabel =
+                          q.question_type === "mcq"
+                            ? "MULTIPLE CHOICE"
+                            : q.question_type === "true_false"
+                            ? "TRUE / FALSE"
+                            : q.question_type === "short_answer"
+                            ? "SHORT ANSWER"
+                            : "LONG ANSWER"
+
+                        return (
+                          <section
+                            className="panel question-card"
+                            key={q.question_id}
+                            style={{
+                              borderLeft: quizSubmitted
+                                ? `3px solid ${
+                                    isCorrect === true
+                                      ? "#6fba8c"
+                                      : isCorrect === false
+                                      ? "#c97070"
+                                      : "#e6e0ed"
+                                  }`
+                                : undefined,
+                            }}
+                          >
+                            {/* Header */}
                             <div className="question-card-header">
                               <span>
-                                QUESTION {i + 1} <i>·</i> {tab.toUpperCase()}
+                                QUESTION {idx + 1} <i>·</i> {typeLabel}
+                                &nbsp;
+                                <span
+                                  style={{
+                                    fontSize: "7px",
+                                    padding: "2px 5px",
+                                    borderRadius: "3px",
+                                    background:
+                                      q.difficulty === "easy"
+                                        ? "#edf5ef"
+                                        : q.difficulty === "hard"
+                                        ? "#f9eaea"
+                                        : "#f2edfb",
+                                    color:
+                                      q.difficulty === "easy"
+                                        ? "#5a9571"
+                                        : q.difficulty === "hard"
+                                        ? "#b06060"
+                                        : "#7860a8",
+                                    fontWeight: 600,
+                                    textTransform: "uppercase",
+                                  }}
+                                >
+                                  {q.difficulty}
+                                </span>
                               </span>
-                              <button
-                                className="text-button"
-                                onClick={() =>
-                                  setSaved((s) =>
-                                    s.includes(i)
-                                      ? s.filter((n) => n !== i)
-                                      : [...s, i],
-                                  )
-                                }
-                              >
-                                {saved.includes(i) ? (
-                                  <>
-                                    <Icon name="check" size={15} />
-                                    Saved
-                                  </>
-                                ) : (
-                                  <>
-                                    <Icon name="plus" size={15} />
-                                    Save question
-                                  </>
+                              <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                                {q.source_page_numbers.length > 0 && (
+                                  <span
+                                    style={{
+                                      fontSize: "8px",
+                                      color: "#a08cbb",
+                                      background: "#f4eef9",
+                                      padding: "3px 6px",
+                                      borderRadius: "4px",
+                                      border: "1px solid #ebe0f3",
+                                    }}
+                                  >
+                                    Page {q.source_page_numbers.join(", ")}
+                                  </span>
                                 )}
-                              </button>
+                                {quizSubmitted && evalResult && (
+                                  <span
+                                    style={{
+                                      fontSize: "9px",
+                                      fontWeight: 600,
+                                      color: isCorrect ? "#5a9571" : "#b06060",
+                                      display: "flex",
+                                      alignItems: "center",
+                                      gap: "4px",
+                                    }}
+                                  >
+                                    <Icon name={isCorrect ? "check" : "close"} size={13} />
+                                    {evalResult.score === 1.0
+                                      ? "Full credit"
+                                      : evalResult.score === 0.5
+                                      ? "Partial credit"
+                                      : "No credit"}
+                                  </span>
+                                )}
+                              </span>
                             </div>
-                            <h3>
-                              {tab === "Long Answer"
-                                ? [
-                                    "Explain the three normal forms and illustrate each with a database example.",
-                                    "Discuss the trade-offs between normalization and query performance.",
-                                    "Describe insertion, update, and deletion anomalies with examples.",
-                                  ][i % 3]
-                                : [
-                                    "What is the primary purpose of database normalization?",
-                                    "Which normal form removes partial dependencies?",
-                                    "What is a transitive dependency?",
-                                    "How does a primary key identify a record?",
-                                    "Why should repeating groups be avoided?",
-                                  ][i % 5]}
-                            </h3>
-                            {tab === "Multiple Choice" && (
-                              <div className="answer-options">
-                                {(i % 5 === 0
-                                  ? [
-                                      "Increase data duplication",
-                                      "Reduce redundancy and improve consistency",
-                                      "Remove all primary keys",
-                                      "Store every fact in a single table",
-                                    ]
-                                  : i % 5 === 1
-                                    ? [
-                                        "First Normal Form",
-                                        "Second Normal Form",
-                                        "Third Normal Form",
-                                        "No normal form",
-                                      ]
-                                    : i % 5 === 2
-                                      ? [
-                                          "An attribute depends on a non-key attribute",
-                                          "Every attribute is a key",
-                                          "A table has no rows",
-                                          "A field contains a single value",
-                                        ]
-                                      : i % 5 === 3
-                                        ? [
-                                            "By its position in the table",
-                                            "By a unique, non-null value",
-                                            "By its display color",
-                                            "By its file size",
-                                          ]
-                                        : [
-                                            "They always improve consistency",
-                                            "They make data harder to query and update",
-                                            "They eliminate dependencies",
-                                            "They automatically create keys",
-                                          ]
-                                ).map((o, j) => (
-                                  <div key={o}>
-                                    <span>{String.fromCharCode(65 + j)}</span>
-                                    {o}
-                                  </div>
-                                ))}
-                              </div>
+
+                            {/* Question prompt */}
+                            <h3>{q.question_text}</h3>
+
+                            {/* MCQ options */}
+                            {(q.question_type === "mcq" || q.question_type === "true_false") &&
+                              q.options && (
+                                <div className="answer-options">
+                                  {q.options.map((opt, j) => {
+                                    const selected = userAnswers[q.question_id] === opt
+                                    const isCorrectOpt =
+                                      quizSubmitted &&
+                                      evalResult &&
+                                      opt.toLowerCase() === evalResult.correct_answer.toLowerCase()
+                                    const isWrongSelected =
+                                      quizSubmitted &&
+                                      evalResult &&
+                                      selected &&
+                                      opt.toLowerCase() !== evalResult.correct_answer.toLowerCase()
+                                    return (
+                                      <div
+                                        key={opt}
+                                        role="button"
+                                        tabIndex={quizSubmitted ? -1 : 0}
+                                        onClick={() => {
+                                          if (quizSubmitted) return
+                                          setUserAnswers((prev) => ({
+                                            ...prev,
+                                            [q.question_id]: opt,
+                                          }))
+                                        }}
+                                        onKeyDown={(e) => {
+                                          if (e.key === "Enter" || e.key === " ") {
+                                            if (quizSubmitted) return
+                                            setUserAnswers((prev) => ({
+                                              ...prev,
+                                              [q.question_id]: opt,
+                                            }))
+                                          }
+                                        }}
+                                        style={{
+                                          cursor: quizSubmitted ? "default" : "pointer",
+                                          border: `1px solid ${
+                                            isCorrectOpt
+                                              ? "#6fba8c"
+                                              : isWrongSelected
+                                              ? "#c97070"
+                                              : selected
+                                              ? "var(--indigo)"
+                                              : "#eee7f3"
+                                          }`,
+                                          background: isCorrectOpt
+                                            ? "rgba(111,186,140,.1)"
+                                            : isWrongSelected
+                                            ? "rgba(201,112,112,.08)"
+                                            : selected
+                                            ? "rgba(115,97,190,.07)"
+                                            : undefined,
+                                          transition: "border .15s, background .15s",
+                                        }}
+                                      >
+                                        <span
+                                          style={{
+                                            background: isCorrectOpt
+                                              ? "#6fba8c"
+                                              : isWrongSelected
+                                              ? "#c97070"
+                                              : selected
+                                              ? "var(--indigo)"
+                                              : undefined,
+                                            color:
+                                              isCorrectOpt || isWrongSelected || selected
+                                                ? "#fff"
+                                                : undefined,
+                                          }}
+                                        >
+                                          {String.fromCharCode(65 + j)}
+                                        </span>
+                                        {opt}
+                                        {isCorrectOpt && (
+                                          <Icon
+                                            name="check"
+                                            size={14}
+                                            className=""
+                                          />
+                                        )}
+                                      </div>
+                                    )
+                                  })}
+                                </div>
+                              )}
+
+                            {/* Short Answer textarea */}
+                            {q.question_type === "short_answer" && (
+                              <textarea
+                                disabled={quizSubmitted}
+                                placeholder="Write your answer here…"
+                                value={userAnswers[q.question_id] ?? ""}
+                                onChange={(e) =>
+                                  setUserAnswers((prev) => ({
+                                    ...prev,
+                                    [q.question_id]: e.target.value,
+                                  }))
+                                }
+                                style={{
+                                  width: "100%",
+                                  minHeight: "70px",
+                                  border: "1px solid #e2d9ee",
+                                  borderRadius: "7px",
+                                  padding: "10px 12px",
+                                  fontSize: "12px",
+                                  color: "#7a668f",
+                                  background: quizSubmitted ? "#faf8fc" : "#fdfcfe",
+                                  resize: "vertical",
+                                  outline: "none",
+                                  lineHeight: "1.7",
+                                  marginTop: "4px",
+                                }}
+                              />
                             )}
-                            <button
-                              className="text-button"
-                              onClick={() =>
-                                setExpanded((s) =>
-                                  s.includes(i)
-                                    ? s.filter((n) => n !== i)
-                                    : [...s, i],
-                                )
-                              }
-                            >
-                              {expanded.includes(i)
-                                ? "Hide sample answer"
-                                : "Show sample answer"}
-                              <Icon name="chevron" size={15} />
-                            </button>
-                            {expanded.includes(i) && (
-                              <div className="expanded-answer">
-                                <strong>Sample answer</strong>
-                                <p>
-                                  {tab === "Long Answer"
-                                    ? "1NF ensures atomic values. 2NF removes partial dependencies on a composite key. 3NF removes transitive dependencies. For example, separate departments from students so department details are stored once, and link the tables with a department ID."
-                                    : [
-                                        "Normalization reduces redundancy and improves consistency by organizing related facts into separate tables.",
-                                        "Second Normal Form (2NF) removes partial dependencies. Each non-key attribute must depend on the whole primary key.",
-                                        "A transitive dependency occurs when a non-key attribute depends on another non-key attribute rather than directly on the key.",
-                                        "A primary key uses a unique, non-null value to identify each record.",
-                                        "Repeating groups make querying and updating more difficult and violate First Normal Form.",
-                                      ][i % 5]}
+
+                            {/* Long Answer textarea */}
+                            {q.question_type === "long_answer" && (
+                              <textarea
+                                disabled={quizSubmitted}
+                                placeholder="Write your detailed answer here…"
+                                value={userAnswers[q.question_id] ?? ""}
+                                onChange={(e) =>
+                                  setUserAnswers((prev) => ({
+                                    ...prev,
+                                    [q.question_id]: e.target.value,
+                                  }))
+                                }
+                                style={{
+                                  width: "100%",
+                                  minHeight: "110px",
+                                  border: "1px solid #e2d9ee",
+                                  borderRadius: "7px",
+                                  padding: "10px 12px",
+                                  fontSize: "12px",
+                                  color: "#7a668f",
+                                  background: quizSubmitted ? "#faf8fc" : "#fdfcfe",
+                                  resize: "vertical",
+                                  outline: "none",
+                                  lineHeight: "1.7",
+                                  marginTop: "4px",
+                                }}
+                              />
+                            )}
+
+                            {/* Post-submission feedback */}
+                            {quizSubmitted && evalResult && (
+                              <div
+                                className="expanded-answer"
+                                style={{
+                                  marginTop: "14px",
+                                  background: isCorrect
+                                    ? "rgba(111,186,140,.08)"
+                                    : "rgba(201,112,112,.06)",
+                                  border: `1px solid ${isCorrect ? "#c5e4cf" : "#e8c0c0"}`,
+                                }}
+                              >
+                                <strong style={{ color: isCorrect ? "#4d8f65" : "#a85555" }}>
+                                  {isCorrect ? "✓ Correct" : "✗ Review needed"}
+                                </strong>
+                                <p style={{ marginTop: "6px", color: "#7a668f" }}>
+                                  <strong>Your answer:</strong>{" "}
+                                  {evalResult.user_answer || <em>No answer provided</em>}
+                                </p>
+                                <p style={{ color: "#7a668f" }}>
+                                  <strong>Correct answer:</strong> {evalResult.correct_answer}
+                                </p>
+                                <p style={{ color: "#856fa5", marginTop: "6px" }}>
+                                  {evalResult.feedback}
+                                </p>
+                                <p
+                                  style={{
+                                    fontSize: "10px",
+                                    color: "#9a84b0",
+                                    borderTop: "1px solid #ede5f3",
+                                    paddingTop: "8px",
+                                    marginTop: "10px",
+                                  }}
+                                >
+                                  <Icon name="file" size={12} />
+                                  &nbsp;{evalResult.explanation}
                                 </p>
                               </div>
                             )}
                           </section>
-                        ))}
-                      {savedOnly && !saved.length && (
-                        <div className="empty-state panel">
-                          <Icon name="cards" size={28} />
-                          <h2>Your saved set starts here.</h2>
-                          <p>
-                            Save a sample question to revisit it during this
-                            session.
-                          </p>
+                        )
+                      })}
+
+                      {/* Submit / progress bar */}
+                      {!quizSubmitted && (
+                        <div
+                          style={{
+                            padding: "20px",
+                            background: "#fff",
+                            border: "1px solid var(--border)",
+                            borderRadius: "9px",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: "16px",
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <span style={{ fontSize: "10px", color: "#a294ae" }}>
+                            {Object.keys(userAnswers).length} / {quizQuestions.length} answered
+                          </span>
+                          <Button
+                            disabled={questionsBusy}
+                            onClick={handleSubmitQuiz}
+                          >
+                            {questionsBusy ? (
+                              <span className="spinner" />
+                            ) : (
+                              <Icon name="check" size={16} />
+                            )}{" "}
+                            {questionsBusy ? "Evaluating…" : "Submit Quiz"}
+                          </Button>
                         </div>
                       )}
                     </div>
-                  ) : (
+                  ) : generated && !questionsBusy ? (
+                    <div className="empty-state panel revision-empty">
+                      <div className="large-spark">
+                        <Icon name="cards" size={30} />
+                      </div>
+                      <h2>No questions could be extracted.</h2>
+                      <p>
+                        The document may not have enough structured text.
+                        <br />
+                        Try a different PDF with clear definitions and headings.
+                      </p>
+                    </div>
+                  ) : !questionsBusy ? (
                     <div className="empty-state panel revision-empty">
                       <div className="large-spark">
                         <Icon name="cards" size={30} />
                       </div>
                       <h2>A little practice. A lot more confidence.</h2>
                       <p>
-                        Choose your material and generate sample questions.
+                        Upload a PDF, choose your question types and difficulty,
                         <br />
-                        Saved questions stay available during this session only.
+                        then hit <strong>Generate Quiz</strong> for real grounded questions.
                       </p>
+                    </div>
+                  ) : (
+                    <div className="loading-state" style={{ justifyContent: "center", padding: "48px" }}>
+                      <span className="spinner" />
+                      Extracting academic concepts and building your quiz…
                     </div>
                   )}
                 </>
-              )}
+              ))}
             </>
           )}
         </main>
@@ -1427,7 +2738,10 @@ export default function App() {
         </div>
       )}
       {modal && (
-        <div className="modal-backdrop" onClick={() => setModal(null)}>
+        <div
+          className="modal-backdrop"
+          onClick={() => !uploading && setModal(null)}
+        >
           <section
             className="modal"
             role="dialog"
@@ -1435,7 +2749,7 @@ export default function App() {
             aria-labelledby="modal-title"
             onClick={(e) => e.stopPropagation()}
             onKeyDown={(e) => {
-              if (e.key === "Escape") setModal(null)
+              if (e.key === "Escape" && !uploading) setModal(null)
               if (e.key === "Tab") {
                 const controls = Array.from(
                   e.currentTarget.querySelectorAll<HTMLElement>(
@@ -1457,8 +2771,16 @@ export default function App() {
             <button
               className="icon-button modal-close"
               aria-label="Close dialog"
+              disabled={uploading}
               autoFocus
-              onClick={() => setModal(null)}
+              onClick={() => {
+                if (!uploading) {
+                  setModal(null)
+                  setSelectedFile(null)
+                  setUploadName("")
+                  setUploadError("")
+                }
+              }}
             >
               <Icon name="close" />
             </button>
@@ -1489,18 +2811,20 @@ export default function App() {
             {modal === "upload" && (
               <>
                 <p>
-                  Add a PDF to try the prototype. Only its filename is used
-                  locally; your file is not uploaded, read, or stored.
+                  Upload your study notes in any format: PDF (.pdf), PowerPoint (.pptx),
+                  Word (.docx), Text notes (.txt, .md), or Photos/Images (.png, .jpg) with automated OCR.
+                  Content is chunked, embedded, and stored persistently in SQLite.
                 </p>
                 <input
                   type="file"
-                  accept=".pdf,application/pdf"
+                  accept=".pdf,.pptx,.ppt,.docx,.doc,.txt,.md,.markdown,.png,.jpg,.jpeg,.webp,.bmp"
                   ref={fileInput}
                   hidden
                   onChange={(e) => selectFile(e.target.files?.[0])}
                 />
                 <button
                   className="dropzone modal-dropzone"
+                  disabled={uploading}
                   onClick={() => fileInput.current?.click()}
                   onDragOver={(e) => e.preventDefault()}
                   onDrop={(e) => {
@@ -1510,9 +2834,13 @@ export default function App() {
                 >
                   <Icon name={uploadName ? "file" : "upload"} size={25} />
                   <strong>
-                    {uploadName || "Choose a PDF or drop it here"}
+                    {uploadName || "Choose any note file or photo, or drop it here"}
                   </strong>
-                  <small>PDF only · Maximum 20 MB</small>
+                  <small>
+                    {selectedFile
+                      ? `${(selectedFile.size / 1024).toFixed(1)} KB · Ready to index`
+                      : "PDF, PPT, DOCX, TXT, or Photos (OCR) · Max 50 MB"}
+                  </small>
                 </button>
                 {uploadError && (
                   <p className="error-message" role="alert">
@@ -1520,32 +2848,31 @@ export default function App() {
                   </p>
                 )}
                 <div className="modal-actions">
-                  <Button variant="secondary" onClick={() => setModal(null)}>
+                  <Button
+                    variant="secondary"
+                    disabled={uploading}
+                    onClick={() => {
+                      setModal(null)
+                      setSelectedFile(null)
+                      setUploadName("")
+                      setUploadError("")
+                    }}
+                  >
                     Cancel
                   </Button>
                   <Button
-                    disabled={!uploadName}
-                    onClick={() => {
-                      setDocs((d) => [
-                        ...d,
-                        {
-                          id: Date.now(),
-                          name: uploadName.replace(/\.pdf$/i, ""),
-                          subject: "Uncategorized",
-                          size: "Demo file",
-                          pages: 0,
-                          date: "Just now",
-                          color: "purple",
-                        },
-                      ])
-                      setUploadName("")
-                      setModal(null)
-                      notify(
-                        "Demo document added. No PDF processing was performed.",
-                      )
-                    }}
+                    disabled={!selectedFile || uploading}
+                    onClick={handleUpload}
                   >
-                    Add demo document
+                    {uploading ? (
+                      <>
+                        <span className="spinner" /> Indexing notes…
+                      </>
+                    ) : (
+                      <>
+                        <Icon name="upload" size={16} /> Upload & Index Notes
+                      </>
+                    )}
                   </Button>
                 </div>
               </>
@@ -1586,8 +2913,8 @@ export default function App() {
             {modal === "delete" && (
               <>
                 <p>
-                  “{doc?.name}” will be removed from this demo workspace. Your
-                  original PDF will not be affected.
+                  “{doc?.name}” will be permanently removed from your SQLite database
+                  and vector store.
                 </p>
                 <div className="modal-actions">
                   <Button variant="secondary" onClick={() => setModal(null)}>
@@ -1595,16 +2922,25 @@ export default function App() {
                   </Button>
                   <Button
                     variant="danger"
-                    onClick={() => {
+                    onClick={async () => {
+                      const docToDelete = doc
+                      if (docToDelete?.backendDocId) {
+                        try {
+                          await deleteDocument(docToDelete.backendDocId)
+                          notify(`"${docToDelete.name}" permanently deleted from database.`)
+                        } catch {
+                          notify("Could not delete from backend database.")
+                        }
+                      }
                       setDocs((d) => d.filter((item) => item.id !== activeDoc))
                       setMessages([])
-                      setSummary(false)
+                      setSummaryResult(null)
+                      setSummaryError("")
                       setGenerated(false)
                       setModal(null)
-                      notify("Demo document removed.")
                     }}
                   >
-                    Remove document
+                    Delete document
                   </Button>
                 </div>
               </>
@@ -1612,15 +2948,15 @@ export default function App() {
             {modal === "help" && (
               <>
                 <p>
-                  Start with the sample documents, ask a question, explore a
-                  summary, or build a revision set using the sidebar.
+                  StudySphere AI is an intelligent workspace that extracts text from any note format
+                  (PDF, PowerPoint, Word, text, and photos via RapidOCR) and allows grounded Q&A,
+                  summarization, and revision quiz generation.
                 </p>
                 <div className="help-note">
-                  <strong>A prototype, not a connected AI service.</strong>
+                  <strong>Persistent Local SQLite & Vector Search</strong>
                   <p>
-                    All AI outputs are prewritten examples. Files are not
-                    uploaded or processed. Changes and saved questions are kept
-                    only in this browser session. No account is required.
+                    Uploaded documents are embedded with sentence-transformers and saved directly into
+                    SQLite. Everything is processed offline/locally without requiring cloud API keys.
                   </p>
                 </div>
                 <Button onClick={() => setModal(null)}>
