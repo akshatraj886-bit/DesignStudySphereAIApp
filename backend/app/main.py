@@ -66,6 +66,7 @@ default_origins = [
     "http://127.0.0.1:8443",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://design-study-sphere-ai-app.vercel.app",
 ]
 
 env_origins = os.getenv("ALLOWED_ORIGINS")
