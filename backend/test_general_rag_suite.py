@@ -20,9 +20,12 @@ import json
 import time
 import asyncio
 import httpx
-import pymupdf
+import pymupdf as fitz
 from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 # Ensure backend root is on sys.path
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,7 +33,7 @@ if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
 
 from app.main import app
-from app.rag.generator import generator_instance
+from app.rag.generator import generator_instance, detect_query_language, format_gemini_contents
 from app.rag.retrieval import detect_page_intent, is_document_summary_intent
 
 
@@ -812,13 +815,91 @@ def run_comprehensive_evaluation_suite():
     record(len(last_event_b.get("cited_sources", [])) > 0, "Partial stream preserved valid cited sources on termination")
 
     # -------------------------------------------------------------------------
+    # TEST 21: Cross-Language Robustness & Strict Question-Driven Language Matching
+    # -------------------------------------------------------------------------
+    print("\n[21] Testing Cross-Language Robustness & Question-Driven Matching...")
+    generator_instance._model_failure_cooldowns.clear()
+
+    # 1. Unit assertions on detect_query_language
+    record(detect_query_language("What are the five principal states in the process lifecycle?") == "english", "English lifecycle query -> english")
+    record(detect_query_language("Tell me about process scheduling algorithms.") == "english", "Query with 'me' in English -> english")
+    record(detect_query_language("Deadlock ke four Coffman conditions simple Hinglish me samjhao") == "hinglish", "Hinglish Coffman query -> hinglish")
+    record(detect_query_language("Page 2 me kya hai explain karo") == "hinglish", "Hinglish page query -> hinglish")
+    record(detect_query_language("प्रक्रिया के विभिन्न चरण कौन से हैं?") == "hindi", "Devanagari query -> hindi")
+
+    # 2. Upload Hinglish document
+    doc_hi = fitz.open()
+    p_hi = doc_hi.new_page(width=595, height=842)
+    p_hi.insert_text(
+        (50, 60),
+        "Operating Systems Concepts in Hinglish:\n"
+        "Process ek executing program hota hai jisme code, program counter, aur registers shamil hote hain.\n"
+        "Process ke paanch mukhya states hote hain: New, Ready, Running, Waiting, aur Terminated.\n"
+        "Process Control Block (PCB) me process id (PID) aur CPU scheduling ki jaankari hoti hai.\n"
+        "[Page 1]"
+    )
+    up_hi = client.post("/api/documents/upload", files={"file": ("os_hinglish_test.pdf", doc_hi.tobytes(), "application/pdf")})
+    assert up_hi.status_code == 200
+    doc_hi_id = up_hi.json()["document_id"]
+
+    # Case A: English Question on Hinglish Document
+    res21_a = client.post(
+        "/api/ask",
+        json={"question": "What are the five principal states of a process?", "document_id": doc_hi_id, "top_k": 2},
+    )
+    assert res21_a.status_code == 200
+    d21_a = res21_a.json()
+    ans21_a = d21_a["answer"]
+    record(d21_a["retrieval_status"] == "found", "Retrieval status is 'found' across languages")
+    record(all(s in ans21_a for s in ["New", "Ready", "Running", "Waiting", "Terminated"]), "Answer correctly enumerates all 5 states")
+    record("hote hain" not in ans21_a.lower() and "aapke notes" not in ans21_a.lower(), "English question on Hinglish doc produces English answer without Hinglish phrases")
+    record(len(d21_a.get("cited_sources", [])) > 0, "Preserved valid citations [Page 1]")
+
+    # Case B: Hinglish Question on English Document
+    res21_b = client.post(
+        "/api/ask",
+        json={"question": "Process ke states ke bare me batao aur PCB me kya hota hai", "document_id": os_doc_id, "top_k": 2},
+    )
+    assert res21_b.status_code == 200
+    d21_b = res21_b.json()
+    ans21_b = d21_b["answer"]
+    record(d21_b["retrieval_status"] == "found", "Hinglish query on English doc retrieved context")
+    record(any(w in ans21_b.lower() for w in ["hote", "hai", "hain", "anusaar", "bindu", "paribhasha"]), "Hinglish question on English doc produces Hinglish response")
+    record(len(d21_b.get("cited_sources", [])) > 0, "Preserved valid citations")
+
+    # Case C: Devanagari Hindi Question on English Document
+    res21_c = client.post(
+        "/api/ask",
+        json={"question": "प्रक्रिया (process) के विभिन्न चरण कौन से हैं?", "document_id": os_doc_id, "top_k": 2},
+    )
+    assert res21_c.status_code == 200
+    d21_c = res21_c.json()
+    ans21_c = d21_c["answer"]
+    record(d21_c["retrieval_status"] == "found", "Devanagari query on English doc retrieved context")
+    record(bool(re.search(r"[\u0900-\u097F]", ans21_c)), "Devanagari Hindi query produces Devanagari Hindi answer")
+
+    # Case D: English Question with prior Hinglish turn in Conversation History
+    history_lang = [
+        {"role": "user", "content": "PCB ke bare me batao simple Hinglish me"},
+        {"role": "model", "content": "PCB me process ki saari jaankari jaise PID aur Program Counter hota hai [Page 1]."},
+    ]
+    contents_lang = format_gemini_contents(
+        question="What are the states of a process?",
+        valid_candidates=[{"excerpt": "The principal states of a process are: New, Running, Waiting, Ready, Terminated. [Page 1]", "page_number": 1}],
+        conversation_history=history_lang,
+    )
+    prompt_text_lang = contents_lang[-1]["parts"][0]["text"]
+    record("LANGUAGE MANDATE (STRICT):" in prompt_text_lang and "The student asked this question in ENGLISH" in prompt_text_lang, "Prompt injects strict English mandate despite prior Hinglish conversation turns")
+    record("NEVER say 'Hey! ... me ... yeh hote hain'" in prompt_text_lang, "Prompt explicitly forbids Hinglish phrasing for English query")
+
+    # -------------------------------------------------------------------------
     # EVALUATION SUMMARY
     # -------------------------------------------------------------------------
     total_checks = passed + failed
     pass_pct = (passed / total_checks) * 100 if total_checks else 0.0
     print("\n" + "=" * 80)
     print("COMPREHENSIVE EVALUATION BENCHMARK RESULTS:")
-    print(f"• Total Capabilities Verified: 20 / 20")
+    print(f"• Total Capabilities Verified: 21 / 21")
     print(f"• Specific Assertions Run: {total_checks}")
     print(f"• Passed: {passed}")
     print(f"• Failed: {failed}")
@@ -826,7 +907,7 @@ def run_comprehensive_evaluation_suite():
     print("=" * 80)
 
     if failed == 0:
-        print("\nALL 20 GENERAL RAG EVALUATION DIMENSIONS PASSED PERFECTLY!\n")
+        print("\nALL 21 GENERAL RAG EVALUATION DIMENSIONS PASSED PERFECTLY!\n")
         return 0
     else:
         print(f"\nEvaluation completed with {failed} failures.\n")

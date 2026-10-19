@@ -59,11 +59,12 @@ GROUNDED_SYSTEM_PROMPT = """You are StudySphere AI, a high-fidelity academic ass
 Your job is to explain concepts clearly, accurately, and directly using the factual information in the provided [DOCUMENT PASSAGES].
 
 CORE RULES:
-1. Language & Conversational Style:
-   - Faithfully match the student's question language and conversational style.
-   - If the student asks in Hindi / Hinglish (e.g. "kya hota hai", "samjhao", "iska main objective", "simple bhasha me"), reply in natural, clear Hinglish (or Devanagari Hindi if question used Devanagari script).
-   - Always preserve technical terminology in English with bold styling (e.g., **Normalization**, **Primary Key**, **Virtual Memory**, **Insert Anomaly**).
-   - If asked in English, reply in polished, structured academic English.
+1. Strict Question-Driven Language Matching:
+   - The student's CURRENT question language strictly dictates the answer language.
+   - NEVER carry over or contaminate the answer language from previous chat messages, default templates, or the language of the uploaded document text.
+   - If the current question is in English: You MUST answer entirely in clear academic English. Never use Hinglish or Hindi phrasing (such as 'Hey! ... me ... yeh hote hain' or 'Aapke notes ke anusaar').
+   - If the current question is in Hinglish (Roman script Hindi): You MUST answer in natural, conversational Hinglish with key technical terms bolded in English.
+   - If the current question is in Devanagari Hindi: You MUST answer in clear Devanagari Hindi (हिन्दी) with technical terms preserved.
 
 2. Scope-Aware Answer Structure:
    - Page-Specific Questions (e.g. "Page 2 me kya hai?", "Explain slide 3"): Focus strictly on the content provided for that page. Cite '[Page X]' for every point.
@@ -131,15 +132,60 @@ def extract_substantive_query_terms(query: str) -> List[str]:
     return tokens
 
 
+def detect_query_language(query: str) -> str:
+    """
+    Detects the primary language of the student's CURRENT question:
+    - 'hindi': If question contains Devanagari Unicode characters (\u0900-\u097F).
+    - 'hinglish': If question contains distinctive Romanized Hindi question particles,
+                 markers, or verbs (e.g., kya, kaise, kyun, batao, samjhao, hota, hoti,
+                 hote, hai, hain, iska, iski, iske, mein, chahiye, saral, aasan, bhasha).
+    - 'english': Default for questions asked in English.
+    """
+    if not query:
+        return "english"
+
+    if re.search(r"[\u0900-\u097F]", query):
+        return "hindi"
+
+    q_lower = query.lower()
+    tokens = set(re.findall(r"\b[a-zA-Z]+\b", q_lower))
+
+    # Strict, unambiguous Hinglish markers (zero collision with English words)
+    PURE_HINGLISH_MARKERS = {
+        "kya", "kyu", "kyun", "kaise", "kaisey", "kisko", "kisme", "kismein",
+        "konsa", "kaunsa", "kon", "kaun", "kitna", "kitne", "kitni", "kahan", "kaha",
+        "hai", "hain", "hoon", "hun", "hoga", "hogi", "hoge",
+        "hota", "hoti", "hote", "hotiye", "kare", "karo", "karein", "karna", "karega", "karegi", "karege",
+        "batao", "bataye", "batayein", "samjhao", "samjhaiye", "samajh", "bataiye", "likho", "likhiye",
+        "chahiye", "sakte", "sakti", "sakta",
+        "iska", "iski", "iske", "uska", "uski", "uske", "inhe", "unhe", "isse", "usse",
+        "mera", "meri", "mere", "tera", "teri", "tere", "aapka", "aapki", "aapke",
+        "yahan", "wahan", "mein", "saath", "liye", "aur", "magar", "parantu", "kintu",
+        "saral", "asaan", "asan", "mukhya", "bhasha", "shuru", "khatam",
+        "kripya", "dijiye", "bhi", "yeh"
+    }
+
+    if tokens & PURE_HINGLISH_MARKERS:
+        return "hinglish"
+
+    # Contextual multi-word Hinglish phrase patterns
+    HINGLISH_PHRASE_PATTERNS = [
+        r"\b(?:me|mein)\s+(?:kya|kaise|batao|samjhao|hai|hain|karo|bataiye|likho)\b",
+        r"\b(?:kya\s+hai|kya\s+hota|kya\s+hoti|kya\s+hote)\b",
+        r"\b(?:batao|samjhao|bataiye|samjhaiye)\b",
+        r"\b(?:in\s+hinglish|in\s+hindi|simple\s+bhasha|aasan\s+bhasha|saral\s+bhasha)\b",
+        r"\b(?:ke\s+bare\s+me|ke\s+baare\s+mein)\b",
+        r"\b(?:page|slide)\s+\d+\s+me\b",
+    ]
+    if any(re.search(pat, q_lower) for pat in HINGLISH_PHRASE_PATTERNS):
+        return "hinglish"
+
+    return "english"
+
+
 def is_hinglish_or_hindi_query(query: str) -> bool:
     """Detects if query contains Hindi or Hinglish question markers/phrases."""
-    tokens = set(re.findall(r"\b[a-zA-Z]+\b", query.lower()))
-    hinglish_markers = {
-        "kya", "hota", "hoti", "hote", "hai", "hain", "iska", "iski", "iske",
-        "aur", "samjhao", "batao", "kaise", "kyun", "kisme", "kare", "karo",
-        "bhasha", "saral", "asaan", "niche", "upar", "mein", "me", "karna", "chahiye"
-    }
-    return bool(tokens & hinglish_markers)
+    return detect_query_language(query) in ("hinglish", "hindi")
 
 
 def is_refusal_response(text: str) -> bool:
@@ -377,16 +423,44 @@ def format_context_prompt(
             "Structure your answer with clear contrasting points or a comparative summary table.\n"
         )
 
+    lang = detect_query_language(question)
+    if lang == "hindi":
+        lang_directive = (
+            "LANGUAGE MANDATE (STRICT):\n"
+            "- The student asked this question in DEVANAGARI HINDI (हिन्दी).\n"
+            "- You MUST write your entire response in clear Devanagari Hindi.\n"
+            "- Bold technical academic terms and you may include English terms in brackets (e.g., **प्रोसेस (Process)**, **शेड्यूलिंग (Scheduling)**).\n"
+            "- Do NOT answer in English or Latin-script Hinglish.\n"
+            "- Even if the uploaded notes are written in English or another language, answer in Devanagari Hindi as requested by the student's current question."
+        )
+    elif lang == "hinglish":
+        lang_directive = (
+            "LANGUAGE MANDATE (STRICT):\n"
+            "- The student asked this question in HINGLISH (Hindi written in Roman/Latin script).\n"
+            "- You MUST write your entire response in natural, conversational Hinglish.\n"
+            "- Always bold all technical terms in English (e.g., **Process Control Block**, **Context Switching**, **Time Quantum**).\n"
+            "- Do NOT answer purely in formal English or Devanagari script.\n"
+            "- Even if the uploaded notes are written in formal English or another language, explain everything in conversational Hinglish as requested by the student's current question."
+        )
+    else:
+        lang_directive = (
+            "LANGUAGE MANDATE (STRICT):\n"
+            "- The student asked this question in ENGLISH.\n"
+            "- You MUST write your entire response strictly in clear, grammatical English.\n"
+            "- Do NOT use Hinglish, Hindi grammar, or Hindi filler words (e.g., NEVER say 'Hey! ... me ... yeh hote hain' or 'Aapke notes ke anusaar').\n"
+            "- Even if previous chat messages, system prompts, or the uploaded notes contain Hindi or Hinglish, the student's CURRENT question is in English, so your answer MUST be 100% in English."
+        )
+
     return (
         f"[DOCUMENT PASSAGES]\n{passages_block}\n\n"
         f"STUDENT QUESTION: {question}\n\n"
         f"INSTRUCTIONS:\n"
-        f"{scope_directive}"
-        f"1. Language & Style: Answer in the same language and conversational style as the student's question (e.g., respond in natural Hinglish if asked in Hinglish/Hindi, keeping technical terms bolded in English).\n"
+        f"{scope_directive}\n"
+        f"{lang_directive}\n\n"
+        f"1. Grounding & Citations: Cite exact page numbers [Page X] for facts drawn from the passages.\n"
         f"2. Partial Coverage: If the passages cover part of the question (e.g., definitions or objectives), answer those supported parts directly using [Page X] citations. Do NOT refuse the whole question.\n"
         f"3. Note Gaps: If any subpart (e.g., detailed individual definitions or examples of anomalies) is only mentioned as an objective or omitted from the notes, clearly explain what the notes DO say with [Page X], state that individual details are omitted from the notes, and provide a concise simple clarification clearly distinguishing it from explicit notes content.\n"
-        f"4. Citations: Cite exact page numbers [Page X] for facts drawn from the passages.\n"
-        f"5. Insufficient Evidence: Only state that you could not find sufficient evidence if the passages have no factual connection to the topic.\n\n"
+        f"4. Insufficient Evidence: Only state that you could not find sufficient evidence if the passages have no factual connection to the topic.\n\n"
         f"ANSWER:"
     )
 
