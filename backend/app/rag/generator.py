@@ -571,9 +571,9 @@ class AnswerGenerator:
     @property
     def current_gemini_timeout(self) -> float:
         try:
-            return float(os.getenv("GEMINI_TIMEOUT_SECONDS", "20.0"))
+            return float(os.getenv("GEMINI_TIMEOUT_SECONDS", "12.0"))
         except ValueError:
-            return 20.0
+            return 12.0
 
     @property
     def ollama_host(self) -> str:
@@ -830,7 +830,8 @@ class AnswerGenerator:
             return
 
         models_to_try = self._get_candidate_models()
-        per_model_timeout = min(self.current_gemini_timeout, 4.0)
+        total_timeout = max(1.0, self.current_gemini_timeout)
+        deadline = time.time() + total_timeout
         contents = format_gemini_contents(
             question=question,
             valid_candidates=valid_candidates,
@@ -839,7 +840,27 @@ class AnswerGenerator:
             target_page=target_page,
         )
 
-        for model_name in models_to_try:
+        for idx, model_name in enumerate(models_to_try):
+            remaining = deadline - time.time()
+            if remaining < 1.0:
+                logger.warning(
+                    "Remaining Gemini streaming timeout budget (%.2fs) exhausted before model '%s'.",
+                    remaining,
+                    model_name,
+                )
+                break
+
+            attempt_timeout = remaining if idx == 0 else min(remaining, 6.0)
+            connect_timeout = min(4.0, attempt_timeout)
+            write_timeout = min(5.0, attempt_timeout)
+            pool_timeout = min(3.0, attempt_timeout)
+            client_timeout = httpx.Timeout(
+                timeout=attempt_timeout,
+                connect=connect_timeout,
+                read=attempt_timeout,
+                write=write_timeout,
+                pool=pool_timeout,
+            )
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model_name}:streamGenerateContent?alt=sse"
@@ -861,16 +882,28 @@ class AnswerGenerator:
             started_yielding = False
 
             try:
-                async with httpx.AsyncClient(timeout=per_model_timeout) as client:
-                    async with client.stream("POST", url, headers=headers, json=payload) as response:
+                async with httpx.AsyncClient(timeout=client_timeout) as client:
+                    stream_ctx = client.stream("POST", url, headers=headers, json=payload)
+                    connect_deadline = min(connect_timeout, remaining)
+                    response = await asyncio.wait_for(stream_ctx.__aenter__(), timeout=connect_deadline)
+                    try:
                         if response.status_code != 200:
-                            if response.status_code == 404:
+                            if response.status_code in (401, 403):
+                                logger.warning(
+                                    "Gemini streaming authentication failed (HTTP %d). Invalid or unauthorized API key. Aborting retries.",
+                                    response.status_code,
+                                )
+                                break
+                            elif response.status_code == 404:
                                 self._model_permanent_failures.add(model_name)
-                                logger.warning("Gemini model '%s' returned 404 Not Found. Excluded permanently.", model_name)
+                                logger.warning("Gemini streaming model '%s' returned 404 Not Found. Excluded permanently.", model_name)
+                            elif response.status_code == 429:
+                                self._model_failure_cooldowns[model_name] = time.time()
+                                logger.warning("Gemini streaming rate limit (429) for '%s'. Trying next candidate.", model_name)
                             else:
                                 self._model_failure_cooldowns[model_name] = time.time()
                                 logger.warning(
-                                    "Gemini streaming returned HTTP %d for model '%s'. Trying next candidate.",
+                                    "Gemini streaming returned HTTP %d for model '%s'.",
                                     response.status_code,
                                     model_name,
                                 )
@@ -879,7 +912,31 @@ class AnswerGenerator:
                         # Model succeeded - clear any prior failure cooldown
                         self._model_failure_cooldowns.pop(model_name, None)
 
-                        async for line in response.aiter_lines():
+                        line_iterator = response.aiter_lines().__aiter__()
+                        while True:
+                            remaining_budget = deadline - time.time()
+                            if remaining_budget <= 0:
+                                logger.warning(
+                                    "Gemini streaming wall-clock deadline (%.2fs) reached for '%s'. Terminating stream.",
+                                    total_timeout,
+                                    model_name,
+                                )
+                                break
+                            try:
+                                line = await asyncio.wait_for(
+                                    line_iterator.__anext__(),
+                                    timeout=min(remaining_budget, attempt_timeout),
+                                )
+                            except StopAsyncIteration:
+                                break
+                            except (asyncio.TimeoutError, httpx.TimeoutException):
+                                logger.warning(
+                                    "Gemini streaming chunk read stalled (remaining budget: %.2fs). Terminating stream for '%s'.",
+                                    remaining_budget,
+                                    model_name,
+                                )
+                                break
+
                             if line.startswith("data: "):
                                 raw_json = line[6:].strip()
                                 if not raw_json:
@@ -898,6 +955,16 @@ class AnswerGenerator:
                                             yield {"token": text_piece}
                                 except Exception as json_err:
                                     logger.debug("Error parsing SSE JSON: %s", json_err)
+                    finally:
+                        await stream_ctx.__aexit__(None, None, None)
+            except (httpx.TimeoutException, asyncio.TimeoutError):
+                self._model_failure_cooldowns[model_name] = time.time()
+                logger.warning(
+                    "Gemini streaming model '%s' timed out after %.2fs. Aborting cloud retries.",
+                    model_name,
+                    attempt_timeout,
+                )
+                break
             except Exception as stream_err:
                 self._model_failure_cooldowns[model_name] = time.time()
                 clean_err = re.sub(r"key=[^\s&]+", "key=REDACTED", str(stream_err))
@@ -942,7 +1009,8 @@ class AnswerGenerator:
             return None
 
         models_to_try = self._get_candidate_models()
-        per_model_timeout = min(self.current_gemini_timeout, 4.0)
+        total_timeout = max(1.0, self.current_gemini_timeout)
+        deadline = time.time() + total_timeout
         contents = format_gemini_contents(
             question=question,
             valid_candidates=valid_candidates,
@@ -951,7 +1019,27 @@ class AnswerGenerator:
             target_page=target_page,
         )
 
-        for model_name in models_to_try:
+        for idx, model_name in enumerate(models_to_try):
+            remaining = deadline - time.time()
+            if remaining < 1.0:
+                logger.warning(
+                    "Remaining Gemini timeout budget (%.2fs) exhausted before model '%s'. Falling back to local synthesizer.",
+                    remaining,
+                    model_name,
+                )
+                break
+
+            attempt_timeout = remaining if idx == 0 else min(remaining, 6.0)
+            connect_timeout = min(4.0, attempt_timeout)
+            write_timeout = min(5.0, attempt_timeout)
+            pool_timeout = min(3.0, attempt_timeout)
+            client_timeout = httpx.Timeout(
+                timeout=attempt_timeout,
+                connect=connect_timeout,
+                read=attempt_timeout,
+                write=write_timeout,
+                pool=pool_timeout,
+            )
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model_name}:generateContent"
@@ -970,8 +1058,11 @@ class AnswerGenerator:
             }
 
             try:
-                async with httpx.AsyncClient(timeout=per_model_timeout) as client:
-                    res = await client.post(url, headers=headers, json=payload)
+                async with httpx.AsyncClient(timeout=client_timeout) as client:
+                    res = await asyncio.wait_for(
+                        client.post(url, headers=headers, json=payload),
+                        timeout=attempt_timeout,
+                    )
                     if res.status_code == 200:
                         self._model_failure_cooldowns.pop(model_name, None)
                         data = res.json()
@@ -1005,6 +1096,12 @@ class AnswerGenerator:
                                     }
                         logger.warning("Gemini API returned 200 but contained no text parts for model '%s'.", model_name)
                         continue
+                    elif res.status_code in (401, 403):
+                        logger.warning(
+                            "Gemini API authentication failed (HTTP %d). Invalid or unauthorized API key. Aborting cloud retries.",
+                            res.status_code,
+                        )
+                        break
                     elif res.status_code == 404:
                         self._model_permanent_failures.add(model_name)
                         logger.warning("Gemini model '%s' returned 404 Not Found. Excluded permanently.", model_name)
@@ -1017,10 +1114,14 @@ class AnswerGenerator:
                         self._model_failure_cooldowns[model_name] = time.time()
                         logger.warning("Gemini rate limit (429) hit for model '%s'. Trying next fallback model.", model_name)
                         continue
-            except httpx.TimeoutException:
+            except (httpx.TimeoutException, asyncio.TimeoutError):
                 self._model_failure_cooldowns[model_name] = time.time()
-                logger.warning("Gemini model '%s' timed out after %s seconds. Trying fallback.", model_name, per_model_timeout)
-                continue
+                logger.warning(
+                    "Gemini model '%s' timed out after %.2fs. Aborting cloud retries.",
+                    model_name,
+                    attempt_timeout,
+                )
+                break
             except Exception as e:
                 self._model_failure_cooldowns[model_name] = time.time()
                 clean_err = re.sub(r"key=[^\s&]+", "key=REDACTED", str(e))

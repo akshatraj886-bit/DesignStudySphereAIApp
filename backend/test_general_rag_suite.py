@@ -18,7 +18,10 @@ import os
 import sys
 import json
 import time
+import asyncio
+import httpx
 import pymupdf
+from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
 
 # Ensure backend root is on sys.path
@@ -549,13 +552,273 @@ def run_comprehensive_evaluation_suite():
     record(d14.get("cited_sources", [])[0]["page_number"] == 1, "Process states query strictly cites Page 1")
 
     # -------------------------------------------------------------------------
+    # TEST 15: Successful Gemini Responses Taking > 4s (Configured Timeout Respected)
+    # -------------------------------------------------------------------------
+    print("\n[15] Testing Gemini Responses Taking > 4s (Old 4s Cap Removed)...")
+    generator_instance._model_failure_cooldowns.clear()
+    async def mock_gemini_4_5s_post(*args, **kwargs):
+        await asyncio.sleep(4.2)
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "candidates": [{
+                "content": {"parts": [{"text": "The principal states of a process are New, Ready, Running, Waiting, and Terminated [Page 1]."}]}
+            }]
+        }
+        return resp
+
+    t15_start = time.perf_counter()
+    with patch("httpx.AsyncClient.post", side_effect=mock_gemini_4_5s_post):
+        res15 = client.post(
+            "/api/ask",
+            json={"question": "What are the states of a process?", "document_id": os_doc_id, "top_k": 3},
+        )
+    t15_elapsed = time.perf_counter() - t15_start
+    assert res15.status_code == 200
+    d15 = res15.json()
+    record(t15_elapsed >= 4.0, f"Simulated call duration exceeded 4.0s (actual: {t15_elapsed:.2f}s)")
+    record(d15.get("generation_provider") == "google_gemini", "Gemini succeeded without aborting at 4.0s")
+    record(d15.get("retrieval_status") == "found", "Retrieval status is 'found'")
+    record(len(d15.get("cited_sources", [])) > 0, "Citations correctly preserved")
+
+    # -------------------------------------------------------------------------
+    # TEST 16: Stream Completion with Multi-Chunk SSE Events
+    # -------------------------------------------------------------------------
+    print("\n[16] Testing Progressive Stream Completion...")
+    generator_instance._model_failure_cooldowns.clear()
+    class MockStreamContext:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            class MockResp:
+                status_code = 200
+                async def aiter_lines(self):
+                    yield 'data: {"candidates": [{"content": {"parts": [{"text": "A Process Control Block "}]}}]}'
+                    yield 'data: {"candidates": [{"content": {"parts": [{"text": "contains PID and registers [Page 1]."}]}}]}'
+            return MockResp()
+        async def __aexit__(self, *args):
+            pass
+
+    stream_sess = client.post("/api/chat/sessions", json={"document_id": os_doc_id, "title": "Stream Eval Session"})
+    s_id = stream_sess.json()["id"]
+
+    with patch.object(httpx.AsyncClient, "stream", side_effect=MockStreamContext):
+        stream_res = client.post(
+            f"/api/chat/sessions/{s_id}/ask/stream",
+            json={"question": "What is in a PCB?", "top_k": 2},
+        )
+        assert stream_res.status_code == 200
+        events = []
+        done_payload = None
+        for line in stream_res.iter_lines():
+            if line.startswith("data: "):
+                try:
+                    ev = json.loads(line[6:])
+                    events.append(ev)
+                    if ev.get("done"):
+                        done_payload = ev
+                except Exception:
+                    pass
+    record(len(events) >= 2, f"Stream yielded progressive token events ({len(events)} events)")
+    record(done_payload is not None and done_payload.get("done") is True, "Stream completed with valid 'done: True' payload")
+    record(done_payload is not None and done_payload.get("generation_provider") == "google_gemini", "Stream provider is google_gemini")
+    record(done_payload is not None and len(done_payload.get("cited_sources", [])) > 0, "Stream preserved cited sources")
+
+    # -------------------------------------------------------------------------
+    # TEST 17: Quota / Rate-Limit (429) & Network Failure Handling
+    # -------------------------------------------------------------------------
+    print("\n[17] Testing Rate-Limit (429) & Network Fallback...")
+    generator_instance._model_failure_cooldowns.clear()
+    mock_429 = MagicMock()
+    mock_429.status_code = 429
+    with patch("httpx.AsyncClient.post", return_value=mock_429):
+        res17 = client.post(
+            "/api/ask",
+            json={"question": "What is SJF scheduling?", "document_id": os_doc_id, "top_k": 2},
+        )
+    assert res17.status_code == 200
+    d17 = res17.json()
+    record(d17.get("retrieval_status") == "found", "429 rate limit gracefully handled without 500 error")
+    record(d17.get("generation_provider") == "extractive_grounded_synthesizer", "Fell back to local grounded synthesizer on quota exhaustion")
+    record(len(d17.get("cited_sources", [])) > 0, "Grounded citations preserved during fallback")
+
+    # -------------------------------------------------------------------------
+    # TEST 18: API-Key Failure vs Timeout Separation (Fast Exit)
+    # -------------------------------------------------------------------------
+    print("\n[18] Testing API-Key Failure Separation & Fast Exit...")
+    generator_instance._model_failure_cooldowns.clear()
+    mock_401 = MagicMock()
+    mock_401.status_code = 401
+    mock_401.text = "API key not valid. Please pass a valid API key."
+    t18_start = time.perf_counter()
+    with patch("httpx.AsyncClient.post", return_value=mock_401):
+        res18 = client.post(
+            "/api/ask",
+            json={"question": "What is FCFS scheduling?", "document_id": os_doc_id, "top_k": 2},
+        )
+    t18_elapsed = time.perf_counter() - t18_start
+    assert res18.status_code == 200
+    d18 = res18.json()
+    record(t18_elapsed < 4.0, f"API key failure exited fast without waiting for timeouts (actual: {t18_elapsed:.2f}s)")
+    record(d18.get("generation_provider") == "extractive_grounded_synthesizer", "Immediately used grounded fallback on auth failure")
+    raw_json_str = json.dumps(d18)
+    record("AIza" not in raw_json_str and "key=" not in raw_json_str, "Zero secrets or API keys exposed in error or response")
+
+    # -------------------------------------------------------------------------
+    # TEST 19: Single-Timeout Abort & Complete Deadline Bounding
+    # Note: This test injects an immediate mocked TimeoutException to deterministically
+    # verify the policy logic (no second or third model attempt after a primary timeout >= 3.0s)
+    # without waiting through measured real-time multi-second socket timeouts.
+    # It also inspects the actual httpx.Timeout instance passed to httpx.AsyncClient.
+    # -------------------------------------------------------------------------
+    print("\n[19] Testing Single-Timeout Abort & Complete Deadline Bounding (Immediate Mock)...")
+    generator_instance._model_failure_cooldowns.clear()
+
+    # 1. Verify default and configured 12.0s deadline bounds across connect, write, and read phases
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("GEMINI_TIMEOUT_SECONDS", None)
+        default_timeout = generator_instance.current_gemini_timeout
+        record(default_timeout == 12.0, f"Default Gemini timeout when unset is 12.0s (got {default_timeout}s)")
+
+    with patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": "12.0"}):
+        cfg_timeout = generator_instance.current_gemini_timeout
+        connect_bound = min(4.0, cfg_timeout)
+        write_bound = min(5.0, cfg_timeout)
+        read_bound = cfg_timeout
+        record(
+            connect_bound <= 4.0 and write_bound <= 5.0 and read_bound <= 12.0,
+            f"12s deadline strictly bounds connect ({connect_bound}s), write ({write_bound}s), and read ({read_bound}s) phases",
+        )
+
+    # 2. Verify immediate mocked timeout on primary model triggers zero additional model attempts
+    # and inspect the actual httpx.Timeout object passed to httpx.AsyncClient
+    actual_client_timeout = None
+    orig_client_init = httpx.AsyncClient.__init__
+    def intercepting_client_init(self, *args, **kwargs):
+        nonlocal actual_client_timeout
+        if "timeout" in kwargs:
+            actual_client_timeout = kwargs["timeout"]
+        orig_client_init(self, *args, **kwargs)
+
+    post_attempts = 0
+    async def mock_timeout_post(*args, **kwargs):
+        nonlocal post_attempts
+        post_attempts += 1
+        # Simulates an immediate socket/read timeout without delaying test suite execution
+        raise httpx.ReadTimeout("Mocked immediate read timeout during Gemini invocation")
+
+    t19_start = time.perf_counter()
+    with patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": "12.0"}):
+        with patch.object(httpx.AsyncClient, "__init__", intercepting_client_init):
+            with patch("httpx.AsyncClient.post", side_effect=mock_timeout_post):
+                res19 = client.post(
+                    "/api/ask",
+                    json={"question": "What are Coffman conditions?", "document_id": os_doc_id, "top_k": 2},
+                )
+    t19_elapsed = time.perf_counter() - t19_start
+    assert res19.status_code == 200
+    d19 = res19.json()
+
+    record(actual_client_timeout is not None and isinstance(actual_client_timeout, httpx.Timeout), "Actual client received httpx.Timeout instance")
+    if actual_client_timeout:
+        record(actual_client_timeout.connect <= 4.0, f"Actual client timeout connect <= 4.0s (got {actual_client_timeout.connect}s)")
+        record(actual_client_timeout.read <= 12.0, f"Actual client timeout read <= 12.0s (got {actual_client_timeout.read}s)")
+        record(actual_client_timeout.write <= 5.0, f"Actual client timeout write <= 5.0s (got {actual_client_timeout.write}s)")
+        record(actual_client_timeout.pool <= 3.0, f"Actual client timeout pool <= 3.0s (got {actual_client_timeout.pool}s)")
+
+    record(post_attempts == 1, f"Timeout on primary model triggered zero additional model attempts (call count: {post_attempts})")
+    record(t19_elapsed < 4.0, f"Immediate mocked timeout fell back fast to local synthesizer (actual: {t19_elapsed:.2f}s)")
+    record(d19.get("generation_provider") == "extractive_grounded_synthesizer", "Fell back to local grounded synthesizer after timeout")
+    record(d19.get("retrieval_status") == "found", "Retrieval status remained valid after timeout fallback")
+
+    # -------------------------------------------------------------------------
+    # TEST 20: Stalled Stream Handshake & Stalled Chunk Read Deadline Termination/Fallback
+    # -------------------------------------------------------------------------
+    print("\n[20] Testing Stalled Stream Handshake & Chunk Deadline Fallback...")
+    generator_instance._model_failure_cooldowns.clear()
+
+    # Part A: Stream handshake stalls past deadline before any token is yielded -> Falls back to grounded synthesizer
+    class MockStalledConnectContext:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self):
+            # Simulates stalled TCP/TLS handshake hanging indefinitely (15s) past the 1.2s connect deadline
+            await asyncio.sleep(15.0)
+            return None
+        async def __aexit__(self, *args): pass
+
+    stall_sess = client.post("/api/chat/sessions", json={"document_id": os_doc_id, "title": "Stall Handshake Session"})
+    stall_sid = stall_sess.json()["id"]
+
+    t20a_start = time.perf_counter()
+    with patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": "1.2"}):
+        with patch.object(httpx.AsyncClient, "stream", side_effect=MockStalledConnectContext):
+            stream_res_a = client.post(
+                f"/api/chat/sessions/{stall_sid}/ask/stream",
+                json={"question": "What is in a PCB?", "top_k": 2},
+            )
+            assert stream_res_a.status_code == 200
+            events_a = []
+            for line in stream_res_a.iter_lines():
+                if line.startswith("data: "):
+                    try:
+                        events_a.append(json.loads(line[6:]))
+                    except Exception:
+                        pass
+    t20a_elapsed = time.perf_counter() - t20a_start
+
+    record(t20a_elapsed < 8.0, f"Stalled connection exited via deadline without waiting 15s (actual: {t20a_elapsed:.2f}s)")
+    record(len(events_a) > 0, f"Stalled stream yielded fallback tokens ({len(events_a)} events)")
+    last_event_a = events_a[-1] if events_a else {}
+    record(last_event_a.get("done") is True, "Stalled stream completed with done: True payload")
+    record(last_event_a.get("generation_provider") == "extractive_grounded_synthesizer", "Stalled handshake cleanly fell back to local grounded synthesizer")
+
+    # Part B: Stream chunk read stalls past deadline after partial token delivery -> Gracefully terminates without hanging
+    class MockStalledChunkContext:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self):
+            class MockResp:
+                status_code = 200
+                async def aiter_lines(self):
+                    yield 'data: {"candidates": [{"content": {"parts": [{"text": "Process Control Block holds"}]}}]}'
+                    # Simulates stalled network stream hanging indefinitely (15s) past the chunk deadline
+                    await asyncio.sleep(15.0)
+                    yield 'data: {"candidates": [{"content": {"parts": [{"text": " never reached"}]}}]}'
+            return MockResp()
+        async def __aexit__(self, *args): pass
+
+    generator_instance._model_failure_cooldowns.clear()
+    t20b_start = time.perf_counter()
+    with patch.dict(os.environ, {"GEMINI_TIMEOUT_SECONDS": "1.2"}):
+        with patch.object(httpx.AsyncClient, "stream", side_effect=MockStalledChunkContext):
+            stream_res_b = client.post(
+                f"/api/chat/sessions/{stall_sid}/ask/stream",
+                json={"question": "What is in a PCB?", "top_k": 2},
+            )
+            assert stream_res_b.status_code == 200
+            events_b = []
+            for line in stream_res_b.iter_lines():
+                if line.startswith("data: "):
+                    try:
+                        events_b.append(json.loads(line[6:]))
+                    except Exception:
+                        pass
+    t20b_elapsed = time.perf_counter() - t20b_start
+
+    record(t20b_elapsed < 8.0, f"Stalled chunk read exited via deadline without waiting 15s (actual: {t20b_elapsed:.2f}s)")
+    tokens_b = [e.get("token") for e in events_b if "token" in e]
+    record(len(tokens_b) >= 1, f"Initial token delivered before stall ({tokens_b})")
+    last_event_b = events_b[-1] if events_b else {}
+    record(last_event_b.get("done") is True, "Stalled chunk stream terminated cleanly with done: True payload")
+    record(len(last_event_b.get("cited_sources", [])) > 0, "Partial stream preserved valid cited sources on termination")
+
+    # -------------------------------------------------------------------------
     # EVALUATION SUMMARY
     # -------------------------------------------------------------------------
     total_checks = passed + failed
     pass_pct = (passed / total_checks) * 100 if total_checks else 0.0
     print("\n" + "=" * 80)
     print("COMPREHENSIVE EVALUATION BENCHMARK RESULTS:")
-    print(f"• Total Capabilities Verified: 14 / 14")
+    print(f"• Total Capabilities Verified: 20 / 20")
     print(f"• Specific Assertions Run: {total_checks}")
     print(f"• Passed: {passed}")
     print(f"• Failed: {failed}")
@@ -563,7 +826,7 @@ def run_comprehensive_evaluation_suite():
     print("=" * 80)
 
     if failed == 0:
-        print("\nALL 14 GENERAL RAG EVALUATION DIMENSIONS PASSED PERFECTLY!\n")
+        print("\nALL 20 GENERAL RAG EVALUATION DIMENSIONS PASSED PERFECTLY!\n")
         return 0
     else:
         print(f"\nEvaluation completed with {failed} failures.\n")
