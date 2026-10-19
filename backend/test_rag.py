@@ -305,8 +305,55 @@ def run_all_tests():
         print(f"  FAIL: {e}")
         results["failed"] += 1
 
+    # 8. Regression: Hinglish Normalization & Citation Separation Test
+    print("\n[Test 8] Regression: Exact Hinglish query on Normalization document...")
+    try:
+        from test_hinglish_grounding import create_normalization_notes_pdf
+        norm_pdf = create_normalization_notes_pdf()
+        norm_files = {"file": ("Normalization_Academic_Notes.pdf", norm_pdf, "application/pdf")}
+        res_norm_upload = client.post("/api/documents/upload", files=norm_files)
+        assert res_norm_upload.status_code == 200
+        norm_doc_id = res_norm_upload.json()["document_id"]
+
+        # Exact Hinglish query from user report
+        hinglish_res = client.post(
+            "/api/ask",
+            json={
+                "question": "Normalization kya hota hai? Iska main objective aur insert, update, delete anomalies simple language me samjhao.",
+                "document_id": norm_doc_id,
+                "top_k": 3,
+            },
+        )
+        assert hinglish_res.status_code == 200
+        h_data = hinglish_res.json()
+        assert h_data["retrieval_status"] == "found", f"Expected found, got {h_data['retrieval_status']}"
+        assert len(h_data["cited_sources"]) > 0, "Expected at least 1 cited source"
+        assert all(cs["page_number"] == 1 for cs in h_data["cited_sources"]), "Citations must strictly be Page 1"
+        assert "Page 1" in h_data["answer"] or "[Page 1]" in h_data["answer"]
+        assert len(h_data["retrieved_sources"]) >= len(h_data["cited_sources"])
+
+        # Unrelated query on the normalization document
+        unrelated_norm = client.post(
+            "/api/ask",
+            json={
+                "question": "Explain the history of the Roman Empire using my uploaded notes",
+                "document_id": norm_doc_id,
+                "top_k": 3,
+            },
+        )
+        assert unrelated_norm.status_code == 200
+        u_data = unrelated_norm.json()
+        assert u_data["retrieval_status"] == "insufficient_evidence"
+        assert len(u_data["cited_sources"]) == 0
+
+        print("  PASS: Hinglish query answered with grounded citations and unrelated query correctly rejected.")
+        results["passed"] += 1
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        results["failed"] += 1
+
     # =========================================================================
-    # 8. EXTENDED 15-QUESTION ACADEMIC BENCHMARK
+    # 9. EXTENDED 15-QUESTION ACADEMIC BENCHMARK
     # =========================================================================
     print("\n" + "=" * 75)
     print("RUNNING EXTENDED 15-QUESTION ACADEMIC EVALUATION BENCHMARK")

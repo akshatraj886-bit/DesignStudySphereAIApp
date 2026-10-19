@@ -596,9 +596,9 @@ export default function App() {
         {
           question: q,
           answer: res.answer,
-          cited_sources: res.cited_sources || res.sources,
-          retrieved_sources: res.retrieved_sources || res.sources,
-          sources: res.cited_sources || res.sources,
+          cited_sources: (res.cited_sources && res.cited_sources.length > 0) ? res.cited_sources : [],
+          retrieved_sources: res.retrieved_sources || res.sources || [],
+          sources: (res.cited_sources && res.cited_sources.length > 0) ? res.cited_sources : [],
           retrieval_status: res.retrieval_status,
           generation_provider: res.generation_provider,
           model_name: res.model_name,
@@ -1535,99 +1535,136 @@ export default function App() {
                               <div style={{ marginTop: "10px" }}>
                                 <FormattedAnswer text={m.answer} />
                               </div>
-                              {((m.cited_sources && m.cited_sources.length > 0) || (m.sources && m.sources.length > 0)) && (
-                                <div className="sources" style={{ marginTop: "18px" }}>
-                                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-                                    <span style={{ fontWeight: 700, letterSpacing: "0.8px", textTransform: "uppercase", fontSize: "9.5px", color: "#c4b5fd" }}>
-                                      EVIDENCE CITED IN ANSWER ({(m.cited_sources || m.sources || []).length} PASSAGE{(m.cited_sources || m.sources || []).length === 1 ? "" : "S"})
-                                    </span>
-                                    <small style={{ fontSize: "8.5px", color: "#94a3b8" }}>
-                                      Scores indicate semantic similarity, not accuracy confidence
-                                    </small>
-                                  </div>
-                                  <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-                                    {(m.cited_sources || m.sources || []).map((s, sIdx) => (
-                                      <div
-                                        key={sIdx}
-                                        className="source-item-card"
-                                        style={{
-                                          padding: "12px 14px",
-                                          background: "rgba(21, 30, 58, 0.75)",
-                                          border: "1px solid rgba(139, 92, 246, 0.25)",
-                                          borderRadius: "10px",
-                                        }}
-                                      >
-                                        <p style={{ margin: 0, fontWeight: 650, fontSize: "12px", display: "flex", alignItems: "center", gap: "7px", color: "#c4b5fd" }}>
-                                          <Icon name="file" size={15} />
-                                          {s.document_name} · Page {s.page_number} · Semantic similarity: {s.similarity_score.toFixed(2)}
-                                        </p>
-                                        <small style={{ display: "block", marginTop: "6px", fontStyle: "italic", color: "#cbd5e1", lineHeight: 1.65, fontSize: "12px" }}>
-                                          "{s.excerpt.length > 220 ? s.excerpt.slice(0, 220) + "..." : s.excerpt}"
-                                        </small>
-                                      </div>
-                                    ))}
-                                  </div>
-
-                                  {/* Optional transparency view for remaining candidate passages */}
-                                  {m.retrieved_sources && m.retrieved_sources.length > (m.cited_sources?.length || m.sources?.length || 0) && (
-                                    <div style={{ marginTop: "12px", borderTop: "1px dashed rgba(139, 92, 246, 0.25)", paddingTop: "10px" }}>
-                                      <button
-                                        type="button"
-                                        onClick={() => {
-                                          setExpandedRetrievals((prev) =>
-                                            prev.includes(i) ? prev.filter((id) => id !== i) : [...prev, i]
-                                          )
-                                        }}
-                                        style={{
-                                          background: "none",
-                                          border: "0",
-                                          color: "#a78bfa",
-                                          fontSize: "11px",
-                                          fontWeight: 600,
-                                          display: "flex",
-                                          alignItems: "center",
-                                          gap: "6px",
-                                          padding: "4px 0",
-                                          cursor: "pointer",
-                                        }}
-                                      >
-                                        <Icon name={expandedRetrievals.includes(i) ? "close" : "search"} size={13} />
-                                        {expandedRetrievals.includes(i)
-                                          ? "Hide candidate search passages"
-                                          : `Inspect ${m.retrieved_sources.length - (m.cited_sources?.length || m.sources?.length || 0)} other retrieved candidate passage(s)`}
-                                      </button>
-                                      {expandedRetrievals.includes(i) && (
-                                        <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginTop: "10px" }}>
-                                          {m.retrieved_sources
-                                            .filter(
-                                              (rs) =>
-                                                !(m.cited_sources || m.sources || []).some(
-                                                  (cs) => cs.chunk_index === rs.chunk_index && cs.page_number === rs.page_number
-                                                )
-                                            )
-                                            .map((rs, rsIdx) => (
-                                              <div
-                                                key={rsIdx}
-                                                style={{
-                                                  padding: "10px 12px",
-                                                  background: "rgba(15, 23, 42, 0.65)",
-                                                  border: "1px solid rgba(148, 163, 184, 0.15)",
-                                                  borderRadius: "8px",
-                                                }}
-                                              >
-                                                <p style={{ margin: 0, fontSize: "11px", color: "#a5b4fc", fontWeight: 600 }}>
-                                                  Candidate: {rs.document_name} · Page {rs.page_number} · Similarity: {rs.similarity_score.toFixed(2)} (Not cited in answer)
-                                                </p>
-                                                <small style={{ display: "block", marginTop: "4px", color: "#94a3b8", fontSize: "11px", lineHeight: 1.5 }}>
-                                                  "{rs.excerpt.slice(0, 160)}..."
-                                                </small>
-                                              </div>
-                                            ))}
-                                        </div>
-                                      )}
+                              {m.retrieval_status === "insufficient_evidence" ? (
+                                m.retrieved_sources && m.retrieved_sources.length > 0 && (
+                                  <div className="sources" style={{ marginTop: "18px" }}>
+                                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+                                      <span style={{ fontWeight: 700, letterSpacing: "0.8px", textTransform: "uppercase", fontSize: "9.5px", color: "#f87171" }}>
+                                        RETRIEVED CANDIDATE EVIDENCE (NOT CITED IN ANSWER) ({m.retrieved_sources.length} PASSAGE{m.retrieved_sources.length === 1 ? "" : "S"})
+                                      </span>
+                                      <small style={{ fontSize: "8.5px", color: "#94a3b8" }}>
+                                        Candidate passages lacked sufficient evidence for this query
+                                      </small>
                                     </div>
-                                  )}
-                                </div>
+                                    <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                                      {m.retrieved_sources.map((s, sIdx) => (
+                                        <div
+                                          key={sIdx}
+                                          className="source-item-card"
+                                          style={{
+                                            padding: "12px 14px",
+                                            background: "rgba(21, 30, 58, 0.45)",
+                                            border: "1px dashed rgba(248, 113, 113, 0.3)",
+                                            borderRadius: "10px",
+                                          }}
+                                        >
+                                          <p style={{ margin: 0, fontWeight: 650, fontSize: "12px", display: "flex", alignItems: "center", gap: "7px", color: "#cbd5e1" }}>
+                                            <Icon name="file" size={15} />
+                                            {s.document_name} · Page {s.page_number} · Semantic similarity: {s.similarity_score.toFixed(2)} (Retrieved, Not Cited)
+                                          </p>
+                                          <small style={{ display: "block", marginTop: "6px", fontStyle: "italic", color: "#94a3b8", lineHeight: 1.65, fontSize: "12px" }}>
+                                            "{s.excerpt.length > 220 ? s.excerpt.slice(0, 220) + "..." : s.excerpt}"
+                                          </small>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )
+                              ) : (
+                                ((m.cited_sources && m.cited_sources.length > 0) || (m.sources && m.sources.length > 0)) && (
+                                  <div className="sources" style={{ marginTop: "18px" }}>
+                                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+                                      <span style={{ fontWeight: 700, letterSpacing: "0.8px", textTransform: "uppercase", fontSize: "9.5px", color: "#c4b5fd" }}>
+                                        EVIDENCE CITED IN ANSWER ({(m.cited_sources || m.sources || []).length} PASSAGE{(m.cited_sources || m.sources || []).length === 1 ? "" : "S"})
+                                      </span>
+                                      <small style={{ fontSize: "8.5px", color: "#94a3b8" }}>
+                                        Passages directly supporting claims in this answer
+                                      </small>
+                                    </div>
+                                    <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                                      {(m.cited_sources || m.sources || []).map((s, sIdx) => (
+                                        <div
+                                          key={sIdx}
+                                          className="source-item-card"
+                                          style={{
+                                            padding: "12px 14px",
+                                            background: "rgba(21, 30, 58, 0.75)",
+                                            border: "1px solid rgba(139, 92, 246, 0.25)",
+                                            borderRadius: "10px",
+                                          }}
+                                        >
+                                          <p style={{ margin: 0, fontWeight: 650, fontSize: "12px", display: "flex", alignItems: "center", gap: "7px", color: "#c4b5fd" }}>
+                                            <Icon name="file" size={15} />
+                                            {s.document_name} · Page {s.page_number} · Semantic similarity: {s.similarity_score.toFixed(2)}
+                                          </p>
+                                          <small style={{ display: "block", marginTop: "6px", fontStyle: "italic", color: "#cbd5e1", lineHeight: 1.65, fontSize: "12px" }}>
+                                            "{s.excerpt.length > 220 ? s.excerpt.slice(0, 220) + "..." : s.excerpt}"
+                                          </small>
+                                        </div>
+                                      ))}
+                                    </div>
+
+                                    {/* Optional transparency view for remaining candidate passages */}
+                                    {m.retrieved_sources && m.retrieved_sources.length > (m.cited_sources?.length || m.sources?.length || 0) && (
+                                      <div style={{ marginTop: "12px", borderTop: "1px dashed rgba(139, 92, 246, 0.25)", paddingTop: "10px" }}>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setExpandedRetrievals((prev) =>
+                                              prev.includes(i) ? prev.filter((id) => id !== i) : [...prev, i]
+                                            )
+                                          }}
+                                          style={{
+                                            background: "none",
+                                            border: "0",
+                                            color: "#a78bfa",
+                                            fontSize: "11px",
+                                            fontWeight: 600,
+                                            display: "flex",
+                                            alignItems: "center",
+                                            gap: "6px",
+                                            padding: "4px 0",
+                                            cursor: "pointer",
+                                          }}
+                                        >
+                                          <Icon name={expandedRetrievals.includes(i) ? "close" : "search"} size={13} />
+                                          {expandedRetrievals.includes(i)
+                                            ? "Hide candidate search passages"
+                                            : `Inspect ${m.retrieved_sources.length - (m.cited_sources?.length || m.sources?.length || 0)} other retrieved candidate passage(s)`}
+                                        </button>
+                                        {expandedRetrievals.includes(i) && (
+                                          <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginTop: "10px" }}>
+                                            {m.retrieved_sources
+                                              .filter(
+                                                (rs) =>
+                                                  !(m.cited_sources || m.sources || []).some(
+                                                    (cs) => cs.chunk_index === rs.chunk_index && cs.page_number === rs.page_number
+                                                  )
+                                              )
+                                              .map((rs, rsIdx) => (
+                                                <div
+                                                  key={rsIdx}
+                                                  style={{
+                                                    padding: "10px 12px",
+                                                    background: "rgba(15, 23, 42, 0.65)",
+                                                    border: "1px solid rgba(148, 163, 184, 0.15)",
+                                                    borderRadius: "8px",
+                                                  }}
+                                                >
+                                                  <p style={{ margin: 0, fontSize: "11px", color: "#a5b4fc", fontWeight: 600 }}>
+                                                    Candidate: {rs.document_name} · Page {rs.page_number} · Similarity: {rs.similarity_score.toFixed(2)} (Retrieved evidence, not cited in answer)
+                                                  </p>
+                                                  <small style={{ display: "block", marginTop: "4px", color: "#94a3b8", fontSize: "11px", lineHeight: 1.5 }}>
+                                                    "{rs.excerpt.slice(0, 160)}..."
+                                                  </small>
+                                                </div>
+                                              ))}
+                                          </div>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                )
                               )}
                             </div>
                           </div>
