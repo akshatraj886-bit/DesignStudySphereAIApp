@@ -1,14 +1,18 @@
 import io
+import logging
 import time
 import uuid
 import pymupdf
 from fastapi import HTTPException, UploadFile, status
+from starlette.concurrency import run_in_threadpool
 from typing import List
 from app.schemas import PageContent, PDFUploadResponse
 from app.rag.chunker import process_document_pages
 from app.rag.embeddings import embedding_service
 import os
 from app.rag.store import store_instance
+
+logger = logging.getLogger("studysphere.pdf_service")
 
 # Configurable max upload size (default: 25 MB to safely prevent OOM on free-tier containers)
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "25"))
@@ -49,59 +53,7 @@ def get_ocr_engine():
     return _ocr_engine if _ocr_engine is not False else None
 
 
-async def process_pdf_upload(
-    file: UploadFile,
-    session_token: str = "default_session",
-) -> PDFUploadResponse:
-    """
-    Universal Document Ingestion Service:
-    Accepts PDF, PowerPoint (PPTX), Word (DOCX), Text/Markdown (TXT/MD),
-    and Photos/Images (PNG, JPG, WEBP) of notes.
-    Extracts text, calculates word/page counts, chunks, generates embeddings,
-    and indexes everything persistently in SQLite.
-    """
-    filename = file.filename or "uploaded_document.pdf"
-    lower_name = filename.lower()
-    ext = "." + lower_name.split(".")[-1] if "." in lower_name else ""
-
-    if ext not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"Unsupported file format '{ext}'. StudySphere AI supports: "
-                "PDF (.pdf), PowerPoint (.pptx), Word (.docx), Text (.txt, .md), "
-                "and Photos/Images (.png, .jpg, .jpeg, .webp)."
-            ),
-        )
-
-    # 1. Read file contents into memory safely
-    try:
-        content = await file.read()
-    except Exception as read_err:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unable to read uploaded file: {str(read_err)}",
-        )
-
-    file_size = len(content)
-
-    # 2. Check for empty files
-    if file_size == 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="The uploaded file is empty (0 bytes). Please upload a valid document or note photo.",
-        )
-
-    # 3. Enforce maximum size limit
-    if file_size > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=(
-                f"File size exceeds the {MAX_UPLOAD_SIZE_MB} MB limit. "
-                f"Uploaded size: {file_size / (1024 * 1024):.2f} MB."
-            ),
-        )
-
+def extract_document_pages(content: bytes, ext: str) -> List[PageContent]:
     pages_data: List[PageContent] = []
 
     # 4. Extract Text Based on Document Type
@@ -136,8 +88,8 @@ async def process_pdf_upload(
                 page = doc.load_page(page_idx)
                 text = page.get_text("text").strip()
 
-                # If page text is very sparse or empty, attempt OCR on page pixmap
-                if len(text) < 15:
+                # If page text is very sparse or empty and contains raster images, attempt OCR on page pixmap
+                if len(text) < 15 and bool(page.get_images()):
                     ocr = get_ocr_engine()
                     if ocr:
                         try:
@@ -295,6 +247,66 @@ async def process_pdf_upload(
                 detail=f"Could not read text file: {str(txt_err)}",
             )
 
+    return pages_data
+
+async def process_pdf_upload(
+    file: UploadFile,
+    session_token: str = "default_session",
+) -> PDFUploadResponse:
+    """
+    Universal Document Ingestion Service:
+    Accepts PDF, PowerPoint (PPTX), Word (DOCX), Text/Markdown (TXT/MD),
+    and Photos/Images (PNG, JPG, WEBP) of notes.
+    Extracts text, calculates word/page counts, chunks, generates embeddings,
+    and indexes everything persistently in SQLite.
+    """
+    upload_started = time.perf_counter()
+    filename = file.filename or "uploaded_document.pdf"
+    lower_name = filename.lower()
+    ext = "." + lower_name.split(".")[-1] if "." in lower_name else ""
+
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unsupported file format '{ext}'. StudySphere AI supports: "
+                "PDF (.pdf), PowerPoint (.pptx), Word (.docx), Text (.txt, .md), "
+                "and Photos/Images (.png, .jpg, .jpeg, .webp)."
+            ),
+        )
+
+    # 1. Read file contents into memory safely
+    try:
+        content = await file.read()
+    except Exception as read_err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unable to read uploaded file: {str(read_err)}",
+        )
+
+    file_size = len(content)
+
+    # 2. Check for empty files
+    if file_size == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The uploaded file is empty (0 bytes). Please upload a valid document or note photo.",
+        )
+
+    # 3. Enforce maximum size limit
+    if file_size > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"File size exceeds the {MAX_UPLOAD_SIZE_MB} MB limit. "
+                f"Uploaded size: {file_size / (1024 * 1024):.2f} MB."
+            ),
+        )
+
+    extraction_started = time.perf_counter()
+    pages_data = await run_in_threadpool(extract_document_pages, content, ext)
+    extraction_seconds = time.perf_counter() - extraction_started
+
     # 5. Aggregate Statistics & Semantic Indexing
     total_characters = sum(p.character_count for p in pages_data)
     total_words = sum(p.word_count for p in pages_data)
@@ -305,10 +317,12 @@ async def process_pdf_upload(
 
     document_id = f"doc_{int(time.time())}_{uuid.uuid4().hex[:8]}"
     chunk_count = 0
+    embedding_seconds = 0.0
 
     if has_extractable_text:
         # Chunk document into overlapping semantic windows
-        chunks = process_document_pages(
+        chunks = await run_in_threadpool(
+            process_document_pages,
             document_id=document_id,
             document_name=filename,
             pages=pages_data,
@@ -319,10 +333,13 @@ async def process_pdf_upload(
 
         # Generate dense semantic embeddings
         chunk_texts = [c.text for c in chunks]
-        embeddings = embedding_service.embed_texts(chunk_texts)
+        embedding_started = time.perf_counter()
+        embeddings = await run_in_threadpool(embedding_service.embed_texts, chunk_texts)
+        embedding_seconds = time.perf_counter() - embedding_started
 
         # Save document and vector embeddings to persistent SQLite store
-        store_instance.save_document(
+        await run_in_threadpool(
+            store_instance.save_document,
             document_id=document_id,
             filename=filename,
             page_count=page_count,
@@ -340,7 +357,8 @@ async def process_pdf_upload(
         )
     else:
         # Store metadata record even if no extractable text
-        store_instance.save_document(
+        await run_in_threadpool(
+            store_instance.save_document,
             document_id=document_id,
             filename=filename,
             page_count=page_count,
@@ -354,6 +372,16 @@ async def process_pdf_upload(
             "Document loaded successfully, but no readable text was detected. "
             "Scanned image documents requiring Optical Character Recognition (OCR) are not yet supported."
         )
+
+    logger.info(
+        "Document indexing complete: extension=%s pages=%d chunks=%d extraction_seconds=%.2f embedding_seconds=%.2f total_seconds=%.2f",
+        ext,
+        page_count,
+        chunk_count,
+        extraction_seconds,
+        embedding_seconds,
+        time.perf_counter() - upload_started,
+    )
 
     return PDFUploadResponse(
         document_id=document_id,

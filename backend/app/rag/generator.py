@@ -12,8 +12,10 @@ Provides:
 
 import os
 import re
+import json
+import asyncio
 import logging
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import List, Dict, Any, Optional, Tuple, Set, AsyncGenerator
 import httpx
 
 logger = logging.getLogger("studysphere.generator")
@@ -589,6 +591,205 @@ class AnswerGenerator:
         # 5. Default: Structured Grounded Extractive Synthesizer (offline, deterministic)
         return self._generate_extractive_grounded(question, valid_candidates, sources, matched_terms)
 
+    async def stream_answer(
+        self,
+        question: str,
+        sources: List[Dict[str, Any]],
+        similarity_threshold: Optional[float] = None,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Streams grounded answer tokens progressively as they are generated.
+        Yields:
+          {"token": str} for progressive text chunks
+          {"done": True, "answer": str, "cited_sources": [...], ...} upon completion.
+        """
+        threshold = (
+            similarity_threshold
+            if similarity_threshold is not None
+            else self.default_threshold
+        )
+
+        is_relevant, reason, matched_terms = verify_topical_evidence(
+            question=question,
+            sources=sources,
+            similarity_threshold=threshold,
+        )
+
+        if not is_relevant and is_follow_up_query(question) and conversation_history:
+            augmented_query = resolve_retrieval_query(question, conversation_history)
+            if augmented_query != question:
+                is_relevant, reason, matched_terms = verify_topical_evidence(
+                    question=augmented_query,
+                    sources=sources,
+                    similarity_threshold=threshold,
+                )
+
+        if not is_relevant:
+            refusal_text = (
+                "I could not find sufficient evidence in the uploaded document(s) "
+                "to answer this question. The retrieved passages do not discuss this topic. "
+                "Try selecting a different document or asking a question covered by your notes."
+            )
+            yield {"token": refusal_text}
+            yield {
+                "done": True,
+                "answer": refusal_text,
+                "retrieval_status": "insufficient_evidence",
+                "cited_sources": [],
+                "retrieved_sources": sources,
+                "generation_provider": "rule_based_grounding_filter",
+                "model_name": None,
+            }
+            return
+
+        valid_candidates = [
+            s for s in sources if s.get("similarity_score", 0.0) >= threshold
+        ]
+        if not valid_candidates:
+            valid_candidates = sources[:2]
+
+        if self.mock_mode:
+            top_source = valid_candidates[0]
+            doc_name = top_source.get("document_name", "Document")
+            page_num = top_source.get("page_number", 1)
+            raw_content = top_source.get("excerpt") or top_source.get("text") or ""
+            mock_ans = (
+                f"### Summary\nBased on **{doc_name}** (Page {page_num}):\n"
+                f"{raw_content[:250]}..."
+            )
+            yield {"token": mock_ans}
+            yield {
+                "done": True,
+                "answer": mock_ans,
+                "retrieval_status": "found",
+                "cited_sources": [top_source],
+                "retrieved_sources": sources,
+                "generation_provider": "mock_test_provider",
+                "model_name": "mock-eval-v1",
+            }
+            return
+
+        # Try streaming Gemini if key is present
+        if self.current_gemini_api_key:
+            gemini_streamed = False
+            async for chunk in self._stream_gemini(
+                question=question,
+                valid_candidates=valid_candidates,
+                all_retrieved=sources,
+                conversation_history=conversation_history,
+            ):
+                gemini_streamed = True
+                yield chunk
+            if gemini_streamed:
+                return
+
+        # Offline / Extractive fallback progressive streaming
+        extractive_res = self._generate_extractive_grounded(
+            question, valid_candidates, sources, matched_terms
+        )
+        answer_text = extractive_res["answer"]
+        words = answer_text.split(" ")
+        step = 3
+        for i in range(0, len(words), step):
+            chunk_str = " ".join(words[i : i + step])
+            if i + step < len(words):
+                chunk_str += " "
+            yield {"token": chunk_str}
+            await asyncio.sleep(0.015)
+
+        extractive_res["done"] = True
+        yield extractive_res
+
+    async def _stream_gemini(
+        self,
+        question: str,
+        valid_candidates: List[Dict[str, Any]],
+        all_retrieved: List[Dict[str, Any]],
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        api_key = self.current_gemini_api_key
+        if not api_key:
+            return
+
+        model_name = self.current_gemini_model
+        timeout_seconds = self.current_gemini_timeout
+        contents = format_gemini_contents(question, valid_candidates, conversation_history)
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_name}:streamGenerateContent?alt=sse"
+        )
+        headers = {
+            "x-goog-api-key": api_key,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "system_instruction": {"parts": [{"text": GROUNDED_SYSTEM_PROMPT}]},
+            "contents": contents,
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 2048,
+            },
+        }
+
+        accumulated_chunks: List[str] = []
+        started_yielding = False
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                async with client.stream("POST", url, headers=headers, json=payload) as response:
+                    if response.status_code != 200:
+                        logger.warning(
+                            "Gemini streaming returned HTTP %d. Falling back to extractive synthesizer.",
+                            response.status_code,
+                        )
+                        return
+
+                    async for line in response.aiter_lines():
+                        if line.startswith("data: "):
+                            raw_json = line[6:].strip()
+                            if not raw_json:
+                                continue
+                            try:
+                                chunk_data = json.loads(raw_json)
+                                candidates = chunk_data.get("candidates", [])
+                                if candidates:
+                                    parts = candidates[0].get("content", {}).get("parts", [])
+                                    text_piece = "".join(
+                                        p.get("text", "") for p in parts if "text" in p and p.get("text")
+                                    )
+                                    if text_piece:
+                                        accumulated_chunks.append(text_piece)
+                                        started_yielding = True
+                                        yield {"token": text_piece}
+                            except Exception as json_err:
+                                logger.debug("Error parsing SSE JSON: %s", json_err)
+        except Exception as stream_err:
+            logger.warning("Gemini streaming exception: %s", stream_err)
+            if not started_yielding:
+                return
+
+        full_text = "".join(accumulated_chunks).strip()
+        if not full_text:
+            return
+
+        cited = extract_cited_sources(full_text, valid_candidates, "found")
+        if cited and not re.search(r"\bPage\s*\d+\b|\[Page\s*\d+\]", full_text, re.IGNORECASE):
+            pages_ref = ", ".join(f"[Page {c.get('page_number', 1)}]" for c in cited)
+            suffix = f"\n\n*({pages_ref})*"
+            full_text += suffix
+            yield {"token": suffix}
+
+        yield {
+            "done": True,
+            "answer": full_text,
+            "retrieval_status": "found",
+            "cited_sources": cited,
+            "retrieved_sources": all_retrieved,
+            "generation_provider": "google_gemini",
+            "model_name": model_name,
+        }
+
     async def _call_gemini(
         self,
         question: str,
@@ -645,8 +846,8 @@ class AnswerGenerator:
 
                                 cited = extract_cited_sources(text, valid_candidates, "found")
                                 if cited and not re.search(r"\bPage\s*\d+\b|\[Page\s*\d+\]", text, re.IGNORECASE):
-                                    ref_str = ", ".join(f"{c.get('document_name', 'Document')} (Page {c.get('page_number', 1)})" for c in cited)
-                                    text = f"{text}\n\n*(Evidence cited from: {ref_str})*"
+                                    ref_str = ", ".join(f"[Page {c.get('page_number', 1)}]" for c in cited)
+                                    text = f"{text}\n\n*({ref_str})*"
 
                                 return {
                                     "answer": text,

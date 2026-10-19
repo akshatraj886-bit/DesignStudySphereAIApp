@@ -1,11 +1,16 @@
 import os
 import re
+import json
+import asyncio
+import logging
 import time
 import uuid
-from typing import Optional
+from typing import Optional, Union, List, Dict, Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, status, Header, Depends, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 
 # Reliable local .env configuration loading
 load_dotenv()
@@ -51,6 +56,8 @@ from app.rag.question_generator import question_generator_instance
 from app.rag.db_adapter import get_engine_type
 from app.rate_limiter import limiter
 
+logger = logging.getLogger("studysphere.api")
+
 # Initialize the FastAPI application
 app = FastAPI(
     title="StudySphere AI Backend",
@@ -59,6 +66,15 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+@app.on_event("startup")
+async def startup_warmup():
+    """Warm up sentence embedding model asynchronously to eliminate upload cold start."""
+    try:
+        asyncio.create_task(run_in_threadpool(embedding_service._load_model))
+        logger.info("Triggered asynchronous background warm-up of embedding model.")
+    except Exception as e:
+        logger.warning("Could not trigger embedding model warm-up: %s", e)
 
 # Determine allowed origins for CORS.
 default_origins = [
@@ -249,8 +265,9 @@ async def upload_pdf(
 
 @app.post(
     "/api/ask",
-    response_model=AskResponse,
+    response_model=None,
     responses={
+        200: {"model": AskResponse},
         400: {"model": ErrorResponse, "description": "Invalid question input"},
         404: {"model": ErrorResponse, "description": "Document not found or access denied"},
         500: {"model": ErrorResponse, "description": "Internal error during RAG retrieval or generation"},
@@ -261,8 +278,10 @@ async def upload_pdf(
 )
 async def ask_question(
     request: AskRequest,
+    raw_request: Request,
+    stream: Optional[bool] = False,
     session_token: str = Depends(get_session_token),
-) -> AskResponse:
+):
     """
     Genuine RAG (Retrieval-Augmented Generation) Question Answering:
     1. Computes query embedding via all-MiniLM-L6-v2.
@@ -288,15 +307,20 @@ async def ask_question(
 
     try:
         # 1. Embed query
-        query_embedding = embedding_service.embed_query(cleaned_query)
+        embedding_started = time.perf_counter()
+        query_embedding = await run_in_threadpool(embedding_service.embed_query, cleaned_query)
+        embedding_seconds = time.perf_counter() - embedding_started
 
         # 2. Retrieve top-k chunks from vector store scoped to session
-        retrieved_raw = store_instance.search_chunks(
+        retrieval_started = time.perf_counter()
+        retrieved_raw = await run_in_threadpool(
+            store_instance.search_chunks,
             query_embedding=query_embedding,
             top_k=request.top_k,
             document_id=request.document_id,
             session_token=session_token,
         )
+        retrieval_seconds = time.perf_counter() - retrieval_started
 
         # Handle overview and shortcut queries (e.g. 'Summarize this chapter', 'Give me an example', 'is pdf me kya hai btao')
         from app.rag.generator import is_overview_or_meta_query
@@ -339,10 +363,60 @@ async def ask_question(
         ]
 
         # 4. Generate grounded answer
+        wants_stream = stream or "text/event-stream" in raw_request.headers.get("accept", "")
+        if wants_stream:
+            async def event_generator():
+                full_answer = ""
+                final_meta = {}
+                candidate_dicts = [s.model_dump() for s in sources]
+                async for chunk in generator_instance.stream_answer(
+                    question=cleaned_query,
+                    sources=candidate_dicts,
+                    similarity_threshold=threshold,
+                ):
+                    if "token" in chunk:
+                        full_answer += chunk["token"]
+                        yield f"data: {json.dumps({'token': chunk['token']})}\n\n"
+                    elif chunk.get("done"):
+                        final_meta = chunk
+
+                cited_raw = final_meta.get("cited_sources", [])
+                final_event = {
+                    "done": True,
+                    "question": cleaned_query,
+                    "answer": final_meta.get("answer", full_answer),
+                    "cited_sources": cited_raw,
+                    "retrieved_sources": final_meta.get("retrieved_sources", candidate_dicts),
+                    "sources": cited_raw,
+                    "retrieval_status": final_meta.get("retrieval_status", "found"),
+                    "generation_provider": final_meta.get("generation_provider", "unknown"),
+                    "model_name": final_meta.get("model_name"),
+                }
+                yield f"data: {json.dumps(final_event)}\n\n"
+
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        generation_started = time.perf_counter()
         gen_result = await generator_instance.generate_answer(
             question=cleaned_query,
             sources=[s.model_dump() for s in sources],
             similarity_threshold=threshold,
+        )
+        logger.info(
+            "Question answered: provider=%s embedding_seconds=%.2f retrieval_seconds=%.2f generation_seconds=%.2f candidates=%d",
+            gen_result.get("generation_provider", "unknown"),
+            embedding_seconds,
+            retrieval_seconds,
+            time.perf_counter() - generation_started,
+            len(retrieved_raw),
         )
 
         cited_raw = gen_result.get("cited_sources", [])
@@ -793,7 +867,13 @@ async def save_chat_message_endpoint(
 
 @app.post(
     "/api/chat/sessions/{session_id}/ask",
-    response_model=ChatAskResponse,
+    response_model=None,
+    responses={
+        200: {"model": ChatAskResponse},
+        400: {"model": ErrorResponse, "description": "Invalid question input"},
+        404: {"model": ErrorResponse, "description": "Session or Document not found"},
+        500: {"model": ErrorResponse, "description": "Internal error during generation"},
+    },
     status_code=status.HTTP_200_OK,
     summary="Ask a grounded conversational question within a persistent chat session",
     tags=["Conversational Chat"],
@@ -801,8 +881,10 @@ async def save_chat_message_endpoint(
 async def chat_session_ask_endpoint(
     session_id: str,
     request: ChatAskRequest,
+    raw_request: Request,
+    stream: Optional[bool] = False,
     session_token: str = Depends(get_session_token),
-) -> ChatAskResponse:
+):
     clean_session_id = session_id.strip()
     session = store_instance.get_chat_session(clean_session_id, session_token=session_token)
     if not session:
@@ -845,13 +927,18 @@ async def chat_session_ask_endpoint(
 
     # 3. Retrieve relevant chunks using vector similarity
     top_k = request.top_k or 4
-    query_embedding = embedding_service.embed_query(retrieval_query)
-    candidate_chunks = store_instance.search_chunks(
+    embedding_started = time.perf_counter()
+    query_embedding = await run_in_threadpool(embedding_service.embed_query, retrieval_query)
+    embedding_seconds = time.perf_counter() - embedding_started
+    retrieval_started = time.perf_counter()
+    candidate_chunks = await run_in_threadpool(
+        store_instance.search_chunks,
         query_embedding=query_embedding,
         top_k=top_k,
         document_id=target_doc_id,
         session_token=session_token,
     )
+    retrieval_seconds = time.perf_counter() - retrieval_started
 
     from app.rag.generator import is_overview_or_meta_query
     if target_doc_id and (is_overview_or_meta_query(retrieval_query) or not candidate_chunks):
@@ -885,11 +972,87 @@ async def chat_session_ask_endpoint(
     )
 
     # 6. Generate answer using cloud Gemini LLM (with multi-turn history and extractive fallbacks)
+    wants_stream = stream or "text/event-stream" in raw_request.headers.get("accept", "")
+    if wants_stream:
+        async def event_generator():
+            full_answer = ""
+            final_meta = {}
+            candidate_dicts = [s.model_dump() for s in formatted_candidates]
+            async for chunk in generator_instance.stream_answer(
+                question=request.question,
+                sources=candidate_dicts,
+                similarity_threshold=threshold,
+                conversation_history=raw_history,
+            ):
+                if "token" in chunk:
+                    full_answer += chunk["token"]
+                    yield f"data: {json.dumps({'token': chunk['token']})}\n\n"
+                elif chunk.get("done"):
+                    final_meta = chunk
+
+            user_msg_id = f"cmsg_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+            asst_msg_id = f"cmsg_{int(time.time()) + 1}_{uuid.uuid4().hex[:8]}"
+
+            store_instance.save_chat_message(
+                message_id=user_msg_id,
+                session_id=clean_session_id,
+                role="user",
+                content=request.question,
+                session_token=session_token,
+            )
+
+            cited_raw = final_meta.get("cited_sources", [])
+            store_instance.save_chat_message(
+                message_id=asst_msg_id,
+                session_id=clean_session_id,
+                role="assistant",
+                content=final_meta.get("answer", full_answer),
+                cited_sources=cited_raw,
+                retrieval_status=final_meta.get("retrieval_status"),
+                generation_provider=final_meta.get("generation_provider"),
+                session_token=session_token,
+            )
+
+            final_event = {
+                "done": True,
+                "session_id": clean_session_id,
+                "question": request.question,
+                "answer": final_meta.get("answer", full_answer),
+                "user_message_id": user_msg_id,
+                "assistant_message_id": asst_msg_id,
+                "cited_sources": cited_raw,
+                "retrieved_sources": final_meta.get("retrieved_sources", candidate_dicts),
+                "sources": cited_raw,
+                "retrieval_status": final_meta.get("retrieval_status", "found"),
+                "generation_provider": final_meta.get("generation_provider", "unknown"),
+                "model_name": final_meta.get("model_name"),
+            }
+            yield f"data: {json.dumps(final_event)}\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    generation_started = time.perf_counter()
     res = await generator_instance.generate_answer(
         question=request.question,
         sources=[s.model_dump() for s in formatted_candidates],
         similarity_threshold=threshold,
         conversation_history=raw_history,
+    )
+    logger.info(
+        "Chat answer generated: provider=%s embedding_seconds=%.2f retrieval_seconds=%.2f generation_seconds=%.2f candidates=%d",
+        res.get("generation_provider", "unknown"),
+        embedding_seconds,
+        retrieval_seconds,
+        time.perf_counter() - generation_started,
+        len(candidate_chunks),
     )
 
     # 7. Persist both the user question and assistant answer in SQLite

@@ -751,6 +751,150 @@ export async function askInChatSession(
 }
 
 /**
+ * Streams tokens progressively from a conversational chat session using SSE.
+ */
+export async function askInChatSessionStream(
+  sessionId: string,
+  question: string,
+  documentId: string | undefined,
+  onToken: (token: string) => void,
+  onComplete: (res: ChatAskResponse) => void,
+  topK: number = 4,
+  similarityThreshold?: number
+): Promise<void> {
+  const payload: ChatAskRequest = {
+    question: question.trim(),
+    document_id: documentId || undefined,
+    top_k: topK,
+    similarity_threshold: similarityThreshold,
+  }
+
+  const res = await fetch(
+    `${API_BASE_URL}/api/chat/sessions/${encodeURIComponent(sessionId)}/ask?stream=true`,
+    {
+      method: "POST",
+      headers: getAuthHeaders({
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+      }),
+      body: JSON.stringify(payload),
+    }
+  )
+
+  if (!res.ok) {
+    let detail = `Conversational Q&A failed with HTTP ${res.status}`
+    try {
+      const errJson = await res.json()
+      if (errJson?.detail) detail = errJson.detail
+    } catch {}
+    throw { message: detail, status: res.status } as ApiError
+  }
+
+  if (!res.body) {
+    throw { message: "No response body available for streaming.", status: res.status } as ApiError
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split("\n")
+    buffer = lines.pop() || ""
+
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (trimmed.startsWith("data: ")) {
+        try {
+          const parsed = JSON.parse(trimmed.slice(6))
+          if (parsed.token) {
+            onToken(parsed.token)
+          }
+          if (parsed.done) {
+            onComplete(parsed as ChatAskResponse)
+          }
+        } catch {
+          // ignore incomplete SSE chunk parse
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Streams tokens progressively from the stateless RAG ask endpoint using SSE.
+ */
+export async function askQuestionStream(
+  question: string,
+  documentId: string | undefined,
+  onToken: (token: string) => void,
+  onComplete: (res: AskResponse) => void,
+  topK: number = 4,
+  similarityThreshold?: number
+): Promise<void> {
+  const payload: AskRequest = {
+    question: question.trim(),
+    document_id: documentId || undefined,
+    top_k: topK,
+    similarity_threshold: similarityThreshold,
+  }
+
+  const res = await fetch(`${API_BASE_URL}/api/ask?stream=true`, {
+    method: "POST",
+    headers: getAuthHeaders({
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    }),
+    body: JSON.stringify(payload),
+  })
+
+  if (!res.ok) {
+    let detail = `Q&A query failed with HTTP ${res.status}`
+    try {
+      const errJson = await res.json()
+      if (errJson?.detail) detail = errJson.detail
+    } catch {}
+    throw { message: detail, status: res.status } as ApiError
+  }
+
+  if (!res.body) {
+    throw { message: "No response body available for streaming.", status: res.status } as ApiError
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split("\n")
+    buffer = lines.pop() || ""
+
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (trimmed.startsWith("data: ")) {
+        try {
+          const parsed = JSON.parse(trimmed.slice(6))
+          if (parsed.token) {
+            onToken(parsed.token)
+          }
+          if (parsed.done) {
+            onComplete(parsed as AskResponse)
+          }
+        } catch {
+          // ignore incomplete SSE chunk parse
+        }
+      }
+    }
+  }
+}
+
+/**
  * Permanently deletes a chat session and its conversation history.
  */
 export async function deleteChatSession(

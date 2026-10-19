@@ -63,6 +63,7 @@ class EmbeddingService:
         # normalize_embeddings=True ensures cosine similarity equals dot product
         embeddings = self._model.encode(
             texts,
+            batch_size=min(len(texts), 64),
             normalize_embeddings=True,
             show_progress_bar=False,
             convert_to_numpy=True,

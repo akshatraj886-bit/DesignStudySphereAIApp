@@ -9,6 +9,7 @@ import { glassTheme } from "./components/glassTheme"
 import {
   uploadPDFDocument,
   askQuestion,
+  askQuestionStream,
   fetchStoredDocuments,
   deleteDocument,
   summarizeDocument,
@@ -18,6 +19,7 @@ import {
   listChatSessions,
   getChatMessages,
   askInChatSession,
+  askInChatSessionStream,
   type PageContent,
   type SourceChunk,
   type SummaryMode,
@@ -304,7 +306,7 @@ function FormattedAnswer({ text }: { text: string }) {
         }
         const isListItem = /^\d+\.\s+/.test(trimmed) || trimmed.startsWith("• ") || trimmed.startsWith("- ")
         const cleanTrimmed = trimmed.replace(/^[-•]\s*/, "")
-        const parts = cleanTrimmed.split(/(\*\*.*?\*\*|\*\(Page \d+\)\*)/g)
+        const parts = cleanTrimmed.split(/(\*\*.*?\*\*|\*\(Page \d+\)\*|\[Page \d+\]|\*\(Page references:.*?\)\*)/gi)
         return (
           <p
             key={idx}
@@ -324,10 +326,11 @@ function FormattedAnswer({ text }: { text: string }) {
                   </strong>
                 )
               }
-              if (p.startsWith("*(Page ") && p.endsWith(")*")) {
+              if (/^(\*\(Page \d+\)\*|\[Page \d+\]|\*\(Page references:.*?\)\*)$/i.test(p)) {
+                const label = p.replace(/^[\*\[\(]+/, "").replace(/[\*\]\)]+$/, "")
                 return (
-                  <span key={pIdx} style={{ color: "#a78bfa", fontWeight: 600, fontSize: "12px", marginLeft: "4px", background: "rgba(99, 102, 241, 0.15)", padding: "1px 5px", borderRadius: "3px" }}>
-                    {p.slice(1, -1)}
+                  <span key={pIdx} style={{ color: "#c4b5fd", fontWeight: 600, fontSize: "11.5px", marginLeft: "4px", background: "rgba(99, 102, 241, 0.18)", padding: "2px 7px", borderRadius: "4px", border: "1px solid rgba(139, 92, 246, 0.28)" }}>
+                    {label}
                   </span>
                 )
               }
@@ -396,6 +399,7 @@ export default function App() {
   const [messages, setMessages] = useState<{
     question: string
     answer: string
+    streaming?: boolean
     cited_sources?: SourceChunk[]
     retrieved_sources?: SourceChunk[]
     sources?: SourceChunk[]
@@ -403,7 +407,6 @@ export default function App() {
     generation_provider?: string
     model_name?: string
   }[]>([])
-  const [expandedRetrievals, setExpandedRetrievals] = useState<number[]>([])
   const [busy, setBusy] = useState(false)
   const [summaryMode, setSummaryMode] = useState<SummaryMode>("short")
   const [summaryResult, setSummaryResult] = useState<SummarizeResponse | null>(null)
@@ -562,6 +565,16 @@ export default function App() {
     setQuestion("")
     setBusy(true)
 
+    // Immediately push question into conversation with an empty streaming answer
+    setMessages((prev) => [
+      ...prev,
+      {
+        question: q,
+        answer: "",
+        streaming: true,
+      },
+    ])
+
     try {
       let currentSessionId = activeSessionId
       if (!currentSessionId && doc.backendDocId) {
@@ -574,36 +587,84 @@ export default function App() {
         }
       }
 
-      let res: {
-        question: string
+      let streamedText = ""
+
+      const handleToken = (token: string) => {
+        streamedText += token
+        setMessages((prev) => {
+          if (!prev.length) return prev
+          const updated = [...prev]
+          const lastIdx = updated.length - 1
+          if (updated[lastIdx].question === q) {
+            updated[lastIdx] = {
+              ...updated[lastIdx],
+              answer: streamedText,
+              streaming: true,
+            }
+          }
+          return updated
+        })
+      }
+
+      const handleComplete = (res: {
+        question?: string
         answer: string
         cited_sources?: SourceChunk[]
         retrieved_sources?: SourceChunk[]
         sources?: SourceChunk[]
-        retrieval_status: "found" | "insufficient_evidence" | "empty_query" | "no_documents"
-        generation_provider: string
+        retrieval_status?: "found" | "insufficient_evidence" | "empty_query" | "no_documents"
+        generation_provider?: string
         model_name?: string
+      }) => {
+        setMessages((prev) => {
+          if (!prev.length) return prev
+          const updated = [...prev]
+          const lastIdx = updated.length - 1
+          if (updated[lastIdx].question === q) {
+            updated[lastIdx] = {
+              question: q,
+              answer: res.answer || streamedText,
+              streaming: false,
+              cited_sources: (res.cited_sources && res.cited_sources.length > 0) ? res.cited_sources : [],
+              retrieved_sources: res.retrieved_sources || res.sources || [],
+              sources: (res.cited_sources && res.cited_sources.length > 0) ? res.cited_sources : [],
+              retrieval_status: res.retrieval_status,
+              generation_provider: res.generation_provider,
+              model_name: res.model_name,
+            }
+          }
+          return updated
+        })
       }
 
-      if (currentSessionId) {
-        res = await askInChatSession(currentSessionId, q, doc.backendDocId)
-      } else {
-        res = await askQuestion(q, doc.backendDocId)
+      try {
+        if (currentSessionId) {
+          await askInChatSessionStream(
+            currentSessionId,
+            q,
+            doc.backendDocId,
+            handleToken,
+            handleComplete
+          )
+        } else {
+          await askQuestionStream(
+            q,
+            doc.backendDocId,
+            handleToken,
+            handleComplete
+          )
+        }
+      } catch (streamErr) {
+        console.warn("Streaming request failed, falling back to non-streaming fetch:", streamErr)
+        let res
+        if (currentSessionId) {
+          res = await askInChatSession(currentSessionId, q, doc.backendDocId)
+        } else {
+          res = await askQuestion(q, doc.backendDocId)
+        }
+        handleComplete(res)
       }
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          question: q,
-          answer: res.answer,
-          cited_sources: (res.cited_sources && res.cited_sources.length > 0) ? res.cited_sources : [],
-          retrieved_sources: res.retrieved_sources || res.sources || [],
-          sources: (res.cited_sources && res.cited_sources.length > 0) ? res.cited_sources : [],
-          retrieval_status: res.retrieval_status,
-          generation_provider: res.generation_provider,
-          model_name: res.model_name,
-        },
-      ])
       addActivity(
         "ask",
         "Question asked",
@@ -616,15 +677,29 @@ export default function App() {
         err && typeof err === "object" && "message" in err
           ? (err as { message: string }).message
           : "Could not retrieve answer from backend."
-      setMessages((prev) => [
-        ...prev,
-        {
-          question: q,
-          answer: `Connection Error: ${errMsg}`,
-          retrieval_status: "insufficient_evidence",
-          generation_provider: "error_handler",
-        },
-      ])
+      setMessages((prev) => {
+        const updated = [...prev]
+        if (updated.length && updated[updated.length - 1].question === q) {
+          updated[updated.length - 1] = {
+            question: q,
+            answer: `Connection Error: ${errMsg}`,
+            streaming: false,
+            retrieval_status: "insufficient_evidence",
+            generation_provider: "error_handler",
+          }
+          return updated
+        }
+        return [
+          ...updated,
+          {
+            question: q,
+            answer: `Connection Error: ${errMsg}`,
+            streaming: false,
+            retrieval_status: "insufficient_evidence",
+            generation_provider: "error_handler",
+          },
+        ]
+      })
     } finally {
       setBusy(false)
     }
@@ -1519,162 +1594,27 @@ export default function App() {
                             </span>
                             <div>
                               <strong>
-                                StudySphere AI{" "}
-                                <span className="sample-tag" style={{ marginLeft: "8px" }}>
-                                  {m.retrieval_status === "insufficient_evidence"
-                                    ? "Insufficient Evidence"
-                                    : m.generation_provider === "google_gemini"
-                                    ? "Gemini Flash Grounded"
-                                    : m.generation_provider === "local_ollama"
-                                    ? "Local Ollama Grounded"
-                                    : m.generation_provider === "extractive_grounded_synthesizer"
-                                    ? "Structured Grounded Synthesis (Notes)"
-                                    : "RAG Grounded Response"}
-                                </span>
+                                StudySphere AI
                               </strong>
                               <div style={{ marginTop: "10px" }}>
-                                <FormattedAnswer text={m.answer} />
+                                {m.answer ? (
+                                  <FormattedAnswer text={m.answer} />
+                                ) : (
+                                  <span style={{ color: "#94a3b8", fontSize: "13px", fontStyle: "italic", display: "inline-flex", alignItems: "center", gap: "8px" }}>
+                                    <span className="spinner" style={{ width: "13px", height: "13px", borderWidth: "2px" }} />
+                                    Thinking and preparing your answer…
+                                  </span>
+                                )}
                               </div>
-                              {m.retrieval_status === "insufficient_evidence" ? (
-                                m.retrieved_sources && m.retrieved_sources.length > 0 && (
-                                  <div className="sources" style={{ marginTop: "18px" }}>
-                                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-                                      <span style={{ fontWeight: 700, letterSpacing: "0.8px", textTransform: "uppercase", fontSize: "9.5px", color: "#f87171" }}>
-                                        RETRIEVED CANDIDATE EVIDENCE (NOT CITED IN ANSWER) ({m.retrieved_sources.length} PASSAGE{m.retrieved_sources.length === 1 ? "" : "S"})
-                                      </span>
-                                      <small style={{ fontSize: "8.5px", color: "#94a3b8" }}>
-                                        Candidate passages lacked sufficient evidence for this query
-                                      </small>
-                                    </div>
-                                    <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-                                      {m.retrieved_sources.map((s, sIdx) => (
-                                        <div
-                                          key={sIdx}
-                                          className="source-item-card"
-                                          style={{
-                                            padding: "12px 14px",
-                                            background: "rgba(21, 30, 58, 0.45)",
-                                            border: "1px dashed rgba(248, 113, 113, 0.3)",
-                                            borderRadius: "10px",
-                                          }}
-                                        >
-                                          <p style={{ margin: 0, fontWeight: 650, fontSize: "12px", display: "flex", alignItems: "center", gap: "7px", color: "#cbd5e1" }}>
-                                            <Icon name="file" size={15} />
-                                            {s.document_name} · Page {s.page_number} · Semantic similarity: {s.similarity_score.toFixed(2)} (Retrieved, Not Cited)
-                                          </p>
-                                          <small style={{ display: "block", marginTop: "6px", fontStyle: "italic", color: "#94a3b8", lineHeight: 1.65, fontSize: "12px" }}>
-                                            "{s.excerpt.length > 220 ? s.excerpt.slice(0, 220) + "..." : s.excerpt}"
-                                          </small>
-                                        </div>
-                                      ))}
-                                    </div>
-                                  </div>
-                                )
-                              ) : (
-                                ((m.cited_sources && m.cited_sources.length > 0) || (m.sources && m.sources.length > 0)) && (
-                                  <div className="sources" style={{ marginTop: "18px" }}>
-                                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-                                      <span style={{ fontWeight: 700, letterSpacing: "0.8px", textTransform: "uppercase", fontSize: "9.5px", color: "#c4b5fd" }}>
-                                        EVIDENCE CITED IN ANSWER ({(m.cited_sources || m.sources || []).length} PASSAGE{(m.cited_sources || m.sources || []).length === 1 ? "" : "S"})
-                                      </span>
-                                      <small style={{ fontSize: "8.5px", color: "#94a3b8" }}>
-                                        Passages directly supporting claims in this answer
-                                      </small>
-                                    </div>
-                                    <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-                                      {(m.cited_sources || m.sources || []).map((s, sIdx) => (
-                                        <div
-                                          key={sIdx}
-                                          className="source-item-card"
-                                          style={{
-                                            padding: "12px 14px",
-                                            background: "rgba(21, 30, 58, 0.75)",
-                                            border: "1px solid rgba(139, 92, 246, 0.25)",
-                                            borderRadius: "10px",
-                                          }}
-                                        >
-                                          <p style={{ margin: 0, fontWeight: 650, fontSize: "12px", display: "flex", alignItems: "center", gap: "7px", color: "#c4b5fd" }}>
-                                            <Icon name="file" size={15} />
-                                            {s.document_name} · Page {s.page_number} · Semantic similarity: {s.similarity_score.toFixed(2)}
-                                          </p>
-                                          <small style={{ display: "block", marginTop: "6px", fontStyle: "italic", color: "#cbd5e1", lineHeight: 1.65, fontSize: "12px" }}>
-                                            "{s.excerpt.length > 220 ? s.excerpt.slice(0, 220) + "..." : s.excerpt}"
-                                          </small>
-                                        </div>
-                                      ))}
-                                    </div>
-
-                                    {/* Optional transparency view for remaining candidate passages */}
-                                    {m.retrieved_sources && m.retrieved_sources.length > (m.cited_sources?.length || m.sources?.length || 0) && (
-                                      <div style={{ marginTop: "12px", borderTop: "1px dashed rgba(139, 92, 246, 0.25)", paddingTop: "10px" }}>
-                                        <button
-                                          type="button"
-                                          onClick={() => {
-                                            setExpandedRetrievals((prev) =>
-                                              prev.includes(i) ? prev.filter((id) => id !== i) : [...prev, i]
-                                            )
-                                          }}
-                                          style={{
-                                            background: "none",
-                                            border: "0",
-                                            color: "#a78bfa",
-                                            fontSize: "11px",
-                                            fontWeight: 600,
-                                            display: "flex",
-                                            alignItems: "center",
-                                            gap: "6px",
-                                            padding: "4px 0",
-                                            cursor: "pointer",
-                                          }}
-                                        >
-                                          <Icon name={expandedRetrievals.includes(i) ? "close" : "search"} size={13} />
-                                          {expandedRetrievals.includes(i)
-                                            ? "Hide candidate search passages"
-                                            : `Inspect ${m.retrieved_sources.length - (m.cited_sources?.length || m.sources?.length || 0)} other retrieved candidate passage(s)`}
-                                        </button>
-                                        {expandedRetrievals.includes(i) && (
-                                          <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginTop: "10px" }}>
-                                            {m.retrieved_sources
-                                              .filter(
-                                                (rs) =>
-                                                  !(m.cited_sources || m.sources || []).some(
-                                                    (cs) => cs.chunk_index === rs.chunk_index && cs.page_number === rs.page_number
-                                                  )
-                                              )
-                                              .map((rs, rsIdx) => (
-                                                <div
-                                                  key={rsIdx}
-                                                  style={{
-                                                    padding: "10px 12px",
-                                                    background: "rgba(15, 23, 42, 0.65)",
-                                                    border: "1px solid rgba(148, 163, 184, 0.15)",
-                                                    borderRadius: "8px",
-                                                  }}
-                                                >
-                                                  <p style={{ margin: 0, fontSize: "11px", color: "#a5b4fc", fontWeight: 600 }}>
-                                                    Candidate: {rs.document_name} · Page {rs.page_number} · Similarity: {rs.similarity_score.toFixed(2)} (Retrieved evidence, not cited in answer)
-                                                  </p>
-                                                  <small style={{ display: "block", marginTop: "4px", color: "#94a3b8", fontSize: "11px", lineHeight: 1.5 }}>
-                                                    "{rs.excerpt.slice(0, 160)}..."
-                                                  </small>
-                                                </div>
-                                              ))}
-                                          </div>
-                                        )}
-                                      </div>
-                                    )}
-                                  </div>
-                                )
-                              )}
                             </div>
                           </div>
                         </div>
                       ))
                     )}
-                    {busy && (
+                    {busy && !messages.some((m) => m.streaming) && (
                       <div className="loading-state">
                         <span className="spinner" />
-                        Retrieving semantic document chunks and synthesizing answer…
+                        Thinking and preparing your answer…
                       </div>
                     )}
                   </div>
@@ -1710,9 +1650,6 @@ export default function App() {
                         <Icon name="arrow" size={22} />
                       </button>
                     </div>
-                    <p>
-                      <Icon name="spark" size={13} /> Answers are strictly grounded in your selected notes using dense semantic retrieval.
-                    </p>
                   </form>
                 </section>
               ))}
