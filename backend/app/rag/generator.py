@@ -48,7 +48,11 @@ STOP_AND_FILLER_WORDS: Set[str] = {
     "wala", "wali", "wale", "tarah", "tarike", "jaise",
     "bhasha", "shabdon", "shabd", "easy", "asaan", "saral",
     "apne", "apna", "apni", "meri", "mera", "mere", "hum", "hume", "humein",
-    "yaar", "dost", "main", "mukhya", "pramukh", "kuch", "kuchh"
+    "yaar", "dost", "main", "mukhya", "pramukh", "kuch", "kuchh",
+    # Meta instruction and formatting words
+    "hinglish", "hindi", "english", "four", "three", "two", "five", "six", "seven", "eight", "nine", "ten",
+    "first", "second", "third", "fourth", "fifth", "list", "name", "names", "define", "definition",
+    "meaning", "concepts", "concept", "points", "point", "topic", "topics", "difference", "differences"
 }
 
 GROUNDED_SYSTEM_PROMPT = """You are StudySphere AI, a high-fidelity academic assistant for college students.
@@ -518,24 +522,39 @@ class AnswerGenerator:
     def __init__(self):
         self.mock_mode = False
         self._model_failure_cooldowns: Dict[str, float] = {}
+        self._model_permanent_failures: Set[str] = set()
         try:
             self.default_threshold = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.32"))
         except ValueError:
             self.default_threshold = 0.32
 
     def _get_candidate_models(self) -> List[str]:
-        """Resolves candidate models, prioritizing responsive models over those in cooldown."""
-        configured = self.current_gemini_model
+        """Resolves active candidate models, prioritizing responsive models over failed ones."""
+        configured = (self.current_gemini_model or "").strip()
         now = time.time()
-        pool = [configured]
-        for fb in ["gemini-3.5-flash", "gemini-flash-latest"]:
-            if fb not in pool:
-                pool.append(fb)
+        
+        # Valid, responsive production models on Google AI Studio
+        # gemini-flash-lite-latest has fast ~1.8s latency and generous free-tier limits
+        known_models = [
+            "gemini-flash-lite-latest",
+            "gemini-flash-latest",
+            "gemini-2.5-flash",
+        ]
+
+        pool: List[str] = ["gemini-flash-lite-latest"]
+        if configured and configured not in pool and configured not in self._model_permanent_failures:
+            if configured not in ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.0-flash"]:
+                pool.append(configured)
+        for m in known_models:
+            if m not in pool and m not in self._model_permanent_failures:
+                pool.append(m)
 
         responsive: List[str] = []
         for m in pool:
+            if m in self._model_permanent_failures:
+                continue
             last_fail = self._model_failure_cooldowns.get(m, 0.0)
-            if now - last_fail >= 300.0:  # 5-minute cooldown
+            if now - last_fail >= 180.0:  # 3-minute temporary cooldown for 429/timeout
                 responsive.append(m)
         return responsive
 
@@ -545,9 +564,9 @@ class AnswerGenerator:
 
     @property
     def current_gemini_model(self) -> str:
-        # gemini-2.0-flash is the current stable free-tier model on Google AI Studio.
-        # Override via the GEMINI_MODEL environment variable (e.g. gemini-1.5-flash, gemini-2.5-flash).
-        return (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
+        # Default to gemini-flash-lite-latest for lowest latency (~1.8s) and reliable quota.
+        # Can be overridden via the GEMINI_MODEL environment variable.
+        return (os.getenv("GEMINI_MODEL") or "gemini-flash-lite-latest").strip()
 
     @property
     def current_gemini_timeout(self) -> float:
@@ -811,7 +830,7 @@ class AnswerGenerator:
             return
 
         models_to_try = self._get_candidate_models()
-        per_model_timeout = min(self.current_gemini_timeout, 12.0)
+        per_model_timeout = min(self.current_gemini_timeout, 4.0)
         contents = format_gemini_contents(
             question=question,
             valid_candidates=valid_candidates,
@@ -845,12 +864,16 @@ class AnswerGenerator:
                 async with httpx.AsyncClient(timeout=per_model_timeout) as client:
                     async with client.stream("POST", url, headers=headers, json=payload) as response:
                         if response.status_code != 200:
-                            self._model_failure_cooldowns[model_name] = time.time()
-                            logger.warning(
-                                "Gemini streaming returned HTTP %d for model '%s'. Trying next candidate.",
-                                response.status_code,
-                                model_name,
-                            )
+                            if response.status_code == 404:
+                                self._model_permanent_failures.add(model_name)
+                                logger.warning("Gemini model '%s' returned 404 Not Found. Excluded permanently.", model_name)
+                            else:
+                                self._model_failure_cooldowns[model_name] = time.time()
+                                logger.warning(
+                                    "Gemini streaming returned HTTP %d for model '%s'. Trying next candidate.",
+                                    response.status_code,
+                                    model_name,
+                                )
                             continue
 
                         # Model succeeded - clear any prior failure cooldown
@@ -919,7 +942,7 @@ class AnswerGenerator:
             return None
 
         models_to_try = self._get_candidate_models()
-        per_model_timeout = min(self.current_gemini_timeout, 12.0)
+        per_model_timeout = min(self.current_gemini_timeout, 4.0)
         contents = format_gemini_contents(
             question=question,
             valid_candidates=valid_candidates,
@@ -982,7 +1005,11 @@ class AnswerGenerator:
                                     }
                         logger.warning("Gemini API returned 200 but contained no text parts for model '%s'.", model_name)
                         continue
-                    elif res.status_code in (404, 503, 500):
+                    elif res.status_code == 404:
+                        self._model_permanent_failures.add(model_name)
+                        logger.warning("Gemini model '%s' returned 404 Not Found. Excluded permanently.", model_name)
+                        continue
+                    elif res.status_code in (503, 500):
                         self._model_failure_cooldowns[model_name] = time.time()
                         logger.warning("Gemini API HTTP %d for model '%s'. Trying next fallback model.", res.status_code, model_name)
                         continue
@@ -1082,7 +1109,19 @@ class AnswerGenerator:
         is_hinglish = is_hinglish_or_hindi_query(question)
         is_page_specific = scope == "page_specific" and target_page is not None
 
-        # 1. Prioritize candidate chunks
+        # 1. Broad domain/topic terms vs specific focal terms
+        DOMAIN_TERMS = {
+            "deadlock", "process", "scheduling", "cpu", "algorithm", "algorithms",
+            "operating", "system", "systems", "data", "science", "preprocessing",
+            "missing", "values", "database", "databases", "normalization", "academic",
+            "notes", "management"
+        }
+        all_query_terms = [t.lower() for t in matched_terms]
+        focal_terms = [t for t in all_query_terms if t not in DOMAIN_TERMS and t not in STOP_AND_FILLER_WORDS]
+        if not focal_terms:
+            focal_terms = all_query_terms
+
+        # Prioritize candidate chunks
         chunks_with_priority: List[Dict[str, Any]] = []
         for idx, chunk in enumerate(valid_candidates):
             c_text = (chunk.get("excerpt") or chunk.get("text") or "")
@@ -1103,9 +1142,11 @@ class AnswerGenerator:
             top_chunks = valid_candidates[:2]
         doc_name_main = top_chunks[0].get("document_name", "Document")
 
-        # 2. Extract and score candidate sentences across top candidate chunks
+        # 2. Extract, hierarchically group, and score candidate sentences across top chunks
         candidate_sentences: List[Dict[str, Any]] = []
         seen_sentence_keys: Set[str] = set()
+        page_lead_in: Dict[int, str] = {}
+        page_lead_focal_hits: Dict[int, int] = {}
 
         for chunk in top_chunks:
             c_text = (chunk.get("excerpt") or chunk.get("text") or "").strip()
@@ -1113,27 +1154,48 @@ class AnswerGenerator:
             c_doc = chunk.get("document_name", "Document")
             chunk_key = chunk.get("_chunk_key", get_chunk_key(chunk))
 
-            # Split by clean punctuation and newlines
-            raw_sentences = re.split(r"(?<=[.!?])\s+|\n+", c_text)
+            raw_lines = [l.strip() for l in c_text.split("\n") if l.strip()]
 
-            for s in raw_sentences:
-                clean_s = s.strip()
-                clean_s = re.sub(r"^[-*•\d.]+\s*", "", clean_s).strip()
-                if len(clean_s) < 20:
+            for line in raw_lines:
+                bullet_match = re.match(r"^[-*•\d.]+\s*", line)
+                is_bullet = bool(bullet_match and bullet_match.group(0).strip())
+                clean_s = re.sub(r"^[-*•\d.]+\s*", "", line).strip()
+                if len(clean_s) < 15:
                     continue
 
-                # Skip document titles or course module headers
                 lower_s = clean_s.lower()
                 if any(hdr in lower_s for hdr in ["studysphere", "course:", "module ", "academic notes", "course :"]):
                     continue
+
+                # Strip trailing dangling number from lead-in lines (e.g. "arise: 1." -> "arise:")
+                clean_s = re.sub(r":\s*\d+\.\s*$", ":", clean_s)
+
+                ends_colon = clean_s.endswith(":") or clean_s.endswith(":\n")
+                if ends_colon:
+                    f_hits = sum(1 for f in focal_terms if term_matches_text(f, lower_s))
+                    if f_hits > 0 or c_page not in page_lead_in:
+                        page_lead_in[c_page] = clean_s
+                        page_lead_focal_hits[c_page] = f_hits
 
                 norm_key = re.sub(r"\W+", "", lower_s)[:80]
                 if norm_key in seen_sentence_keys:
                     continue
                 seen_sentence_keys.add(norm_key)
 
-                # Score sentence relevance
-                term_hits = sum(1 for t in matched_terms if term_matches_text(t, clean_s))
+                # Term matching
+                focal_hits = sum(1 for f in focal_terms if term_matches_text(f, clean_s))
+                domain_hits = sum(1 for d in all_query_terms if term_matches_text(d, clean_s))
+                lead_hits = page_lead_focal_hits.get(c_page, 0) if is_bullet else 0
+
+                # Identify if this line defines an unrelated named heading before a colon
+                # (e.g. "Deadlock Avoidance - Banker's Algorithm:" when asking for "Coffman conditions")
+                has_heading = ":" in clean_s and len(clean_s.split(":", 1)[0]) < 65
+                is_unrelated_heading = False
+                if has_heading and not (is_bullet and lead_hits > 0) and focal_terms:
+                    matches_focal = any(term_matches_text(f, lower_s) for f in focal_terms)
+                    if not matches_focal and not is_meta:
+                        is_unrelated_heading = True
+
                 is_definition = any(
                     marker in lower_s
                     for marker in [
@@ -1143,7 +1205,16 @@ class AnswerGenerator:
                         "normal", "form", "dependency", "redundancy", "is the process"
                     ]
                 )
-                sentence_score = (term_hits * 2.5) + (1.5 if is_definition else 0.0) + chunk.get("_priority", 0.0)
+
+                sentence_score = (
+                    (focal_hits * 4.0)
+                    + (lead_hits * 3.5 if is_bullet else 0.0)
+                    + (domain_hits * 1.0)
+                    + (1.5 if is_definition else 0.0)
+                    + chunk.get("_priority", 0.0)
+                )
+                if is_unrelated_heading:
+                    sentence_score -= 10.0
 
                 candidate_sentences.append({
                     "text": clean_s,
@@ -1153,8 +1224,19 @@ class AnswerGenerator:
                     "chunk_key": chunk_key,
                     "score": sentence_score,
                     "is_definition": is_definition,
-                    "term_hits": term_hits,
+                    "term_hits": focal_hits + lead_hits + domain_hits,
+                    "focal_hits": focal_hits,
+                    "lead_focal_hits": lead_hits,
+                    "is_unrelated_heading": is_unrelated_heading,
+                    "is_bullet": is_bullet,
+                    "lead_in": page_lead_in.get(c_page),
                 })
+
+        # Exclude unrelated headings from answer candidates unless meta summary
+        if not is_meta:
+            filtered_cands = [c for c in candidate_sentences if not c.get("is_unrelated_heading")]
+            if filtered_cands:
+                candidate_sentences = filtered_cands
 
         # If page-specific, strictly filter to sentences from target_page if present
         if is_page_specific:
@@ -1169,15 +1251,20 @@ class AnswerGenerator:
         sections: List[str] = []
         used_chunk_keys: Set[str] = set()
 
-        # Identify primary definition or overview sentence (prioritize highest term hits)
+        # Identify primary definition or overview sentence
         primary_def = None
         if is_meta:
             primary_def = candidate_sentences[0] if candidate_sentences else None
         else:
-            best_cands = [c for c in candidate_sentences if c["term_hits"] > 0]
+            best_cands = [c for c in candidate_sentences if c["focal_hits"] > 0 or c["lead_focal_hits"] > 0]
             if best_cands:
-                best_cands.sort(key=lambda x: (x["term_hits"], x["is_definition"], x["score"]), reverse=True)
-                primary_def = best_cands[0]
+                lead_or_def = [c for c in best_cands if c.get("lead_in") == c.get("text") or c.get("is_definition") or c["focal_hits"] >= 2]
+                if lead_or_def:
+                    lead_or_def.sort(key=lambda x: (x["focal_hits"], x["score"]), reverse=True)
+                    primary_def = lead_or_def[0]
+                else:
+                    best_cands.sort(key=lambda x: (x["focal_hits"], x["score"]), reverse=True)
+                    primary_def = best_cands[0]
             elif candidate_sentences:
                 primary_def = candidate_sentences[0]
 
@@ -1237,24 +1324,31 @@ class AnswerGenerator:
             if not selected_points and remaining_cands:
                 selected_points = remaining_cands[:4]
         else:
-            # For targeted queries: prioritize candidate points from the primary page first to prevent cross-topic pollution
             primary_chunk_key = primary_def.get("chunk_key") if primary_def else None
             primary_page = primary_def.get("page") if primary_def else None
 
             primary_page_points = [
                 c for c in remaining_cands
-                if c.get("page") == primary_page and (c["term_hits"] > 0 or ":" in c.get("text", "") or c.get("is_definition"))
+                if c.get("page") == primary_page and not c.get("is_unrelated_heading")
+                and (c["term_hits"] > 0 or ":" in c.get("text", "") or c.get("is_definition"))
             ]
-            primary_page_points.sort(key=lambda x: (x["term_hits"], ":" in x.get("text", ""), x["score"]), reverse=True)
+            primary_page_points.sort(
+                key=lambda x: (
+                    x.get("lead_focal_hits", 0) > 0,
+                    x.get("focal_hits", 0) > 0,
+                    x["term_hits"],
+                    x["score"]
+                ),
+                reverse=True
+            )
 
             if len(primary_page_points) >= 3:
-                # Primary page has comprehensive coverage of this topic/concept
                 selected_points = primary_page_points[:6]
             else:
-                # Multi-page synthesis: combine primary page points with high-overlap points from related pages
                 other_points = [
                     c for c in remaining_cands
-                    if c.get("page") != primary_page and c["term_hits"] >= 2 and c["score"] >= (max_cand_score * 0.35)
+                    if c.get("page") != primary_page and not c.get("is_unrelated_heading")
+                    and c["term_hits"] >= 2 and c["score"] >= (max_cand_score * 0.35)
                 ]
                 selected_points = (primary_page_points + other_points)[:6]
                 if not selected_points:

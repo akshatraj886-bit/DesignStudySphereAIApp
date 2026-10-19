@@ -414,7 +414,7 @@ def run_comprehensive_evaluation_suite():
     # Temporarily force fallback by putting all gemini models into cooldown
     original_cooldowns = dict(generator_instance._model_failure_cooldowns)
     now = time.time()
-    for m in ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-latest", generator_instance.current_gemini_model]:
+    for m in list(generator_instance._get_candidate_models()) + ["gemini-flash-lite-latest", "gemini-flash-latest", "gemini-2.5-flash", "gemini-3.8-flash", "gemini-3.5-flash", generator_instance.current_gemini_model]:
         generator_instance._model_failure_cooldowns[m] = now
 
     try:
@@ -482,13 +482,80 @@ def run_comprehensive_evaluation_suite():
         record(len(stream_tokens) > 0, f"Progressive streaming yielded {len(stream_tokens)} token events")
 
     # -------------------------------------------------------------------------
+    # TEST 12: Irrelevant-Topic & Entity Bleed Immunity (Cross-Topic Isolation)
+    # -------------------------------------------------------------------------
+    print("\n[12] Testing Irrelevant-Topic Insertion Immunity...")
+    res12_coffman = client.post(
+        "/api/ask",
+        json={"question": "Deadlock ke four Coffman conditions simple Hinglish me samjhao", "document_id": os_doc_id, "top_k": 3},
+    )
+    assert res12_coffman.status_code == 200
+    d12_c = res12_coffman.json()
+    ans_c = d12_c.get("answer", "")
+    record("Mutual Exclusion" in ans_c, "Coffman conditions includes Mutual Exclusion")
+    record("Hold and Wait" in ans_c or "Hold & Wait" in ans_c, "Coffman conditions includes Hold and Wait")
+    record("No Preemption" in ans_c, "Coffman conditions includes No Preemption")
+    record("Circular Wait" in ans_c, "Coffman conditions includes Circular Wait")
+    record("Banker" not in ans_c, "Coffman conditions answer strictly excludes unrelated Banker's Algorithm")
+
+    res12_banker = client.post(
+        "/api/ask",
+        json={"question": "What is Banker's algorithm and safe state sequence?", "document_id": os_doc_id, "top_k": 3},
+    )
+    assert res12_banker.status_code == 200
+    d12_b = res12_banker.json()
+    ans_b = d12_b.get("answer", "")
+    record("Banker" in ans_b, "Banker query directly covers Banker's algorithm")
+    record("Mutual Exclusion" not in ans_b and "Circular Wait" not in ans_b, "Banker query strictly excludes Coffman conditions")
+
+    res12_rr = client.post(
+        "/api/ask",
+        json={"question": "Explain Round Robin (RR) CPU scheduling and the time quantum.", "document_id": os_doc_id, "top_k": 3},
+    )
+    assert res12_rr.status_code == 200
+    d12_rr = res12_rr.json()
+    ans_rr = d12_rr.get("answer", "")
+    record("Round Robin" in ans_rr or "time quantum" in ans_rr, "Round Robin query explains RR and time quantum")
+    record("convoy effect" not in ans_rr, "Round Robin query strictly excludes FCFS convoy effect")
+
+    # -------------------------------------------------------------------------
+    # TEST 13: Latency & Fast Timeout Bounds
+    # -------------------------------------------------------------------------
+    print("\n[13] Testing Latency & Fast Timeout Bounds...")
+    t_start = time.perf_counter()
+    res13 = client.post(
+        "/api/ask",
+        json={"question": "Explain Shortest-Job-First (SJF) CPU scheduling.", "document_id": os_doc_id, "top_k": 3},
+    )
+    t_elapsed = time.perf_counter() - t_start
+    assert res13.status_code == 200
+    d13 = res13.json()
+    record(t_elapsed < 6.0, f"Query execution completed under 6.0s ceiling (actual: {t_elapsed:.2f}s)")
+    record(d13.get("retrieval_status") == "found", "SJF query found relevant context")
+
+    # -------------------------------------------------------------------------
+    # TEST 14: Answer Completeness Across Enumerated Lists
+    # -------------------------------------------------------------------------
+    print("\n[14] Testing Answer Completeness Across Enumerated Lists...")
+    res14 = client.post(
+        "/api/ask",
+        json={"question": "What are the five principal states of a process?", "document_id": os_doc_id, "top_k": 3},
+    )
+    assert res14.status_code == 200
+    d14 = res14.json()
+    ans_p = d14.get("answer", "")
+    all_states_present = all(st in ans_p for st in ["New", "Running", "Waiting", "Ready", "Terminated"])
+    record(all_states_present, "All 5 process states (New, Running, Waiting, Ready, Terminated) present in answer")
+    record(d14.get("cited_sources", [])[0]["page_number"] == 1, "Process states query strictly cites Page 1")
+
+    # -------------------------------------------------------------------------
     # EVALUATION SUMMARY
     # -------------------------------------------------------------------------
     total_checks = passed + failed
     pass_pct = (passed / total_checks) * 100 if total_checks else 0.0
     print("\n" + "=" * 80)
     print("COMPREHENSIVE EVALUATION BENCHMARK RESULTS:")
-    print(f"• Total Capabilities Verified: 11 / 11")
+    print(f"• Total Capabilities Verified: 14 / 14")
     print(f"• Specific Assertions Run: {total_checks}")
     print(f"• Passed: {passed}")
     print(f"• Failed: {failed}")
@@ -496,7 +563,7 @@ def run_comprehensive_evaluation_suite():
     print("=" * 80)
 
     if failed == 0:
-        print("\nALL 11 GENERAL RAG EVALUATION DIMENSIONS PASSED PERFECTLY!\n")
+        print("\nALL 14 GENERAL RAG EVALUATION DIMENSIONS PASSED PERFECTLY!\n")
         return 0
     else:
         print(f"\nEvaluation completed with {failed} failures.\n")
