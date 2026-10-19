@@ -149,18 +149,32 @@ def extract_document_pages(content: bytes, ext: str) -> List[PageContent]:
         )
 
     elif ext in [".pptx", ".ppt"]:
-        # PowerPoint presentation -> Extract slide-by-slide
+        # PowerPoint presentation -> Extract slide-by-slide including tables and grouped shapes
         try:
             import pptx
             prs = pptx.Presentation(io.BytesIO(content))
+
+            def _extract_shape_text(shape) -> List[str]:
+                texts = []
+                if shape.has_text_frame:
+                    for paragraph in shape.text_frame.paragraphs:
+                        t = paragraph.text.strip()
+                        if t:
+                            texts.append(t)
+                elif shape.has_table:
+                    for row in shape.table.rows:
+                        row_txt = " | ".join(c.text.strip() for c in row.cells if c.text.strip())
+                        if row_txt:
+                            texts.append(row_txt)
+                elif hasattr(shape, "shapes"):
+                    for child in shape.shapes:
+                        texts.extend(_extract_shape_text(child))
+                return texts
+
             for slide_idx, slide in enumerate(prs.slides):
                 slide_lines = []
                 for shape in slide.shapes:
-                    if shape.has_text_frame:
-                        for paragraph in shape.text_frame.paragraphs:
-                            t = paragraph.text.strip()
-                            if t:
-                                slide_lines.append(t)
+                    slide_lines.extend(_extract_shape_text(shape))
                 slide_text = "\n".join(slide_lines).strip()
                 char_count = len(slide_text)
                 word_count = len(slide_text.split()) if slide_text else 0

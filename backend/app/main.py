@@ -50,6 +50,7 @@ from app.schemas import (
 from app.pdf_service import process_pdf_upload
 from app.rag.store import store_instance
 from app.rag.embeddings import embedding_service
+from app.rag.retrieval import retrieve_document_context
 from app.rag.generator import generator_instance, resolve_retrieval_query
 from app.rag.summarizer import summarizer_instance
 from app.rag.question_generator import question_generator_instance
@@ -276,12 +277,15 @@ async def upload_pdf(
     summary="Grounded question answering using semantic retrieval over uploaded notes",
     tags=["RAG Q&A"],
 )
+@app.post("/api/ask/stream", response_model=None, include_in_schema=False)
 async def ask_question(
     request: AskRequest,
     raw_request: Request,
     stream: Optional[bool] = False,
     session_token: str = Depends(get_session_token),
 ):
+    if raw_request.url.path.endswith("/stream"):
+        stream = True
     """
     Genuine RAG (Retrieval-Augmented Generation) Question Answering:
     1. Computes query embedding via all-MiniLM-L6-v2.
@@ -306,24 +310,7 @@ async def ask_question(
             )
 
     try:
-        # 1. Embed query
-        embedding_started = time.perf_counter()
-        query_embedding = await run_in_threadpool(embedding_service.embed_query, cleaned_query)
-        embedding_seconds = time.perf_counter() - embedding_started
-
-        # 2. Retrieve top-k chunks from vector store scoped to session
-        retrieval_started = time.perf_counter()
-        retrieved_raw = await run_in_threadpool(
-            store_instance.search_chunks,
-            query_embedding=query_embedding,
-            top_k=request.top_k,
-            document_id=request.document_id,
-            session_token=session_token,
-        )
-        retrieval_seconds = time.perf_counter() - retrieval_started
-
-        # Handle overview and shortcut queries (e.g. 'Summarize this chapter', 'Give me an example', 'is pdf me kya hai btao')
-        from app.rag.generator import is_overview_or_meta_query
+        # 1. Resolve effective document scope
         effective_doc_id = request.document_id
         if not effective_doc_id:
             all_docs = store_instance.list_documents(session_token=session_token)
@@ -336,18 +323,19 @@ async def ask_question(
             else generator_instance.default_threshold
         )
 
-        if effective_doc_id and (
-            is_overview_or_meta_query(cleaned_query)
-            or not retrieved_raw
-        ):
-            doc_chunks = store_instance.get_document_chunks(effective_doc_id, session_token=session_token)
-            if doc_chunks:
-                seen_ids = {r.get("id") for r in retrieved_raw}
-                for idx, chunk in enumerate(doc_chunks[:6]):
-                    if chunk["id"] not in seen_ids:
-                        chunk_copy = dict(chunk)
-                        chunk_copy["similarity_score"] = max(0.72, 0.88 - (idx * 0.03))
-                        retrieved_raw.append(chunk_copy)
+        # 2. Scope-aware, hybrid retrieval coordinator (page-specific, summary, or concept)
+        retrieval_started = time.perf_counter()
+        retrieval_res = await retrieve_document_context(
+            query=cleaned_query,
+            document_id=effective_doc_id,
+            session_token=session_token,
+            top_k=request.top_k,
+            similarity_threshold=threshold,
+        )
+        retrieval_seconds = time.perf_counter() - retrieval_started
+        retrieved_raw = retrieval_res.chunks
+        scope = retrieval_res.scope
+        target_page = retrieval_res.target_page
 
         # 3. Format sources
         sources = [
@@ -357,7 +345,7 @@ async def ask_question(
                 page_number=r["page_number"],
                 chunk_index=r["chunk_index"],
                 similarity_score=r["similarity_score"],
-                excerpt=r["text"],
+                excerpt=r.get("excerpt") or r.get("text", ""),
             )
             for r in retrieved_raw
         ]
@@ -373,6 +361,8 @@ async def ask_question(
                     question=cleaned_query,
                     sources=candidate_dicts,
                     similarity_threshold=threshold,
+                    scope=scope,
+                    target_page=target_page,
                 ):
                     if "token" in chunk:
                         full_answer += chunk["token"]
@@ -409,11 +399,13 @@ async def ask_question(
             question=cleaned_query,
             sources=[s.model_dump() for s in sources],
             similarity_threshold=threshold,
+            scope=scope,
+            target_page=target_page,
         )
         logger.info(
-            "Question answered: provider=%s embedding_seconds=%.2f retrieval_seconds=%.2f generation_seconds=%.2f candidates=%d",
+            "Question answered: provider=%s scope=%s retrieval_seconds=%.2f generation_seconds=%.2f candidates=%d",
             gen_result.get("generation_provider", "unknown"),
-            embedding_seconds,
+            scope,
             retrieval_seconds,
             time.perf_counter() - generation_started,
             len(retrieved_raw),
@@ -878,6 +870,7 @@ async def save_chat_message_endpoint(
     summary="Ask a grounded conversational question within a persistent chat session",
     tags=["Conversational Chat"],
 )
+@app.post("/api/chat/sessions/{session_id}/ask/stream", response_model=None, include_in_schema=False)
 async def chat_session_ask_endpoint(
     session_id: str,
     request: ChatAskRequest,
@@ -885,6 +878,8 @@ async def chat_session_ask_endpoint(
     stream: Optional[bool] = False,
     session_token: str = Depends(get_session_token),
 ):
+    if raw_request.url.path.endswith("/stream"):
+        stream = True
     clean_session_id = session_id.strip()
     session = store_instance.get_chat_session(clean_session_id, session_token=session_token)
     if not session:
@@ -925,31 +920,21 @@ async def chat_session_ask_endpoint(
     # 2. Resolve retrieval query for vector search (handling follow-ups like 'explain the second point')
     retrieval_query = resolve_retrieval_query(request.question, raw_history)
 
-    # 3. Retrieve relevant chunks using vector similarity
-    top_k = request.top_k or 4
-    embedding_started = time.perf_counter()
-    query_embedding = await run_in_threadpool(embedding_service.embed_query, retrieval_query)
-    embedding_seconds = time.perf_counter() - embedding_started
+    # 3. Retrieve relevant chunks using unified scope-aware retrieval coordinator
+    top_k = request.top_k or 5
     retrieval_started = time.perf_counter()
-    candidate_chunks = await run_in_threadpool(
-        store_instance.search_chunks,
-        query_embedding=query_embedding,
-        top_k=top_k,
+    retrieval_res = await retrieve_document_context(
+        query=retrieval_query,
         document_id=target_doc_id,
         session_token=session_token,
+        top_k=top_k,
+        similarity_threshold=request.similarity_threshold or generator_instance.default_threshold,
+        conversation_history=raw_history,
     )
     retrieval_seconds = time.perf_counter() - retrieval_started
-
-    from app.rag.generator import is_overview_or_meta_query
-    if target_doc_id and (is_overview_or_meta_query(retrieval_query) or not candidate_chunks):
-        doc_chunks = store_instance.get_document_chunks(target_doc_id, session_token=session_token)
-        if doc_chunks:
-            seen_ids = {r.get("id") for r in candidate_chunks}
-            for idx, chunk in enumerate(doc_chunks[:6]):
-                if chunk["id"] not in seen_ids:
-                    chunk_copy = dict(chunk)
-                    chunk_copy["similarity_score"] = max(0.72, 0.88 - (idx * 0.03))
-                    candidate_chunks.append(chunk_copy)
+    candidate_chunks = retrieval_res.chunks
+    scope = retrieval_res.scope
+    target_page = retrieval_res.target_page
 
     # 4. Format candidate sources with explicit excerpt attribute
     formatted_candidates = [
@@ -983,6 +968,8 @@ async def chat_session_ask_endpoint(
                 sources=candidate_dicts,
                 similarity_threshold=threshold,
                 conversation_history=raw_history,
+                scope=scope,
+                target_page=target_page,
             ):
                 if "token" in chunk:
                     full_answer += chunk["token"]
@@ -1045,11 +1032,13 @@ async def chat_session_ask_endpoint(
         sources=[s.model_dump() for s in formatted_candidates],
         similarity_threshold=threshold,
         conversation_history=raw_history,
+        scope=scope,
+        target_page=target_page,
     )
     logger.info(
-        "Chat answer generated: provider=%s embedding_seconds=%.2f retrieval_seconds=%.2f generation_seconds=%.2f candidates=%d",
+        "Chat answer generated: provider=%s scope=%s retrieval_seconds=%.2f generation_seconds=%.2f candidates=%d",
         res.get("generation_provider", "unknown"),
-        embedding_seconds,
+        scope,
         retrieval_seconds,
         time.perf_counter() - generation_started,
         len(candidate_chunks),
