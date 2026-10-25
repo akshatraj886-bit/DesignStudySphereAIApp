@@ -16,11 +16,13 @@ Validates all 11 required document-question-answering capabilities:
 
 import os
 import sys
+import re
 import json
 import time
 import asyncio
 import httpx
-import pymupdf as fitz
+import pymupdf
+fitz = pymupdf
 from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
 

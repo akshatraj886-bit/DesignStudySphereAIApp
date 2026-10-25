@@ -77,9 +77,12 @@ CORE RULES:
    - Grounded Claims: Every claim, definition, formula, or fact derived from the notes MUST cite its exact source page: '[Page X]'.
    - NEVER invent or hallucinate page citations or facts that do not appear in the document.
    - Partial Evidence & Gaps:
-     a) If a term (such as insert/update/delete anomalies, or a specific algorithm) is mentioned in the notes as an objective or keyword, cite what the notes DO say with '[Page X]'.
-     b) Clearly state if the notes omit separate in-depth definitions (e.g., 'Notes note: The uploaded notes state ... [Page X], but do not provide detailed individual definitions.').
-     c) Then provide a concise, simple explanation so the student understands, clearly distinguishing this conceptual clarification as supplementary context not explicitly written in the notes. Do not attach a '[Page X]' citation to external supplementary explanations.
+     a) If a term or concept is mentioned in the notes as an objective or keyword, cite what the notes DO say with '[Page X]'.
+     b) Clearly state if the notes omit separate in-depth definitions or proofs (e.g., 'The uploaded notes state ... [Page X], but do not provide detailed individual definitions or derivations.').
+     c) If conceptual clarification is requested or helpful, provide a concise explanation clearly separated from the notes content:
+        '> **Supplementary Context (Not in notes):** <concise explanation>'
+     d) ABSOLUTE RULE: NEVER attach a '[Page X]' citation to supplementary explanations or external background knowledge.
+     e) When the student explicitly asks what the notes contain or state, prioritize the notes content with citations and state gaps without adding unsolicited external text.
 
 4. Unsupported Questions (Unrelated Topics):
    - State 'I could not find sufficient evidence in the uploaded document(s) to answer this question. The retrieved passages do not discuss this topic.' ONLY if the provided passages have NO relevant factual connection to the topic. If partially supported, answer the supported parts faithfully.
@@ -297,6 +300,183 @@ def extract_cited_sources(
     return cited_candidates
 
 
+def validate_answer_citations(
+    answer: str,
+    candidate_chunks: List[Dict[str, Any]],
+) -> str:
+    """
+    Safe citation validator: strips [Page X] tags from the answer text where page X
+    is NOT present in the set of actually retrieved candidate chunks.
+
+    This prevents LLM-hallucinated page citations (e.g. Gemini citing [Page 5] when
+    only pages 1-4 were retrieved) from appearing in the final answer.
+
+    Conservative policy:
+    - Only removes citations for pages that are definitely NOT in the retrieved set.
+    - Never invents or replaces citations.
+    - Does not alter citations for pages that WERE retrieved.
+    - Does not modify the extractive synthesizer's output (only LLM outputs).
+    """
+    if not answer or not candidate_chunks:
+        return answer
+
+    # Build the set of page numbers we actually retrieved
+    retrieved_pages: Set[int] = set()
+    for chunk in candidate_chunks:
+        p = chunk.get("page_number")
+        if p is not None:
+            try:
+                retrieved_pages.add(int(p))
+            except (ValueError, TypeError):
+                pass
+
+    if not retrieved_pages:
+        return answer
+
+    def _strip_invalid_citation(m: re.Match) -> str:
+        raw = m.group(1) or m.group(2)
+        try:
+            page_num = int(raw)
+        except (ValueError, TypeError):
+            return m.group(0)  # keep if unparseable
+        if page_num in retrieved_pages:
+            return m.group(0)  # keep valid citations
+        # Remove the invalid citation (replace with empty string)
+        logger.debug(
+            "Stripping hallucinated citation [Page %d] — not in retrieved pages %s",
+            page_num,
+            sorted(retrieved_pages),
+        )
+        return ""
+
+    # Match [Page X] and (Page X) patterns; leave bare "Page X" intact to avoid
+    # disrupting prose like "...mentioned on Page 3..." which may be internally
+    # consistent without bracket notation.
+    cleaned = re.sub(
+        r"\[Page\s*(\d+)\]|\(Page\s*(\d+)\)",
+        _strip_invalid_citation,
+        answer,
+    )
+
+    # Clean up any double-spaces or leading/trailing whitespace artifacts left by removal
+    cleaned = re.sub(r"  +", " ", cleaned).strip()
+    return cleaned
+
+
+class CitationStreamFilter:
+    """
+    Stateful token stream filter that validates [Page X] and (Page X) citations
+    in-flight to prevent hallucinated page citations from being emitted to the client.
+
+    Maintains a small lookahead buffer when an opening delimiter ('[' or '(') is seen.
+    If the enclosed text is a citation:
+      - Valid page (in retrieved_pages): emitted to stream.
+      - Invalid page (not in retrieved_pages): silently dropped from stream.
+    If the enclosed text is ordinary text (markdown links, acronyms, normal parens):
+      - Emitted immediately to stream without delay.
+    Bounded buffering ensures malformed or unclosed brackets never stall the stream.
+    """
+
+    def __init__(self, candidate_chunks: List[Dict[str, Any]]):
+        self.retrieved_pages: Set[int] = set()
+        for chunk in candidate_chunks:
+            p = chunk.get("page_number")
+            if p is not None:
+                try:
+                    self.retrieved_pages.add(int(p))
+                except (ValueError, TypeError):
+                    pass
+        self._buffer = ""
+
+    def process_chunk(self, chunk: str) -> List[str]:
+        if not chunk:
+            return []
+        self._buffer += chunk
+        emitted: List[str] = []
+
+        while self._buffer:
+            bracket_idx = self._buffer.find("[")
+            paren_idx = self._buffer.find("(")
+
+            opener_idx = -1
+            delimiter_type = None
+            if bracket_idx != -1 and paren_idx != -1:
+                if bracket_idx < paren_idx:
+                    opener_idx, delimiter_type = bracket_idx, "["
+                else:
+                    opener_idx, delimiter_type = paren_idx, "("
+            elif bracket_idx != -1:
+                opener_idx, delimiter_type = bracket_idx, "["
+            elif paren_idx != -1:
+                opener_idx, delimiter_type = paren_idx, "("
+
+            if opener_idx == -1:
+                emitted.append(self._buffer)
+                self._buffer = ""
+                break
+
+            if opener_idx > 0:
+                emitted.append(self._buffer[:opener_idx])
+                self._buffer = self._buffer[opener_idx:]
+                continue
+
+            closer = "]" if delimiter_type == "[" else ")"
+            close_idx = self._buffer.find(closer)
+
+            prefix_pattern = (
+                r"^\[\s*p(?:a(?:g(?:e)?)?)?"
+                if delimiter_type == "["
+                else r"^\(\s*p(?:a(?:g(?:e)?)?)?"
+            )
+            is_possible_citation = bool(re.match(prefix_pattern, self._buffer, re.IGNORECASE))
+            if len(self._buffer) == 1:
+                is_possible_citation = True
+
+            if not is_possible_citation:
+                if close_idx != -1:
+                    emitted.append(self._buffer[: close_idx + 1])
+                    self._buffer = self._buffer[close_idx + 1 :]
+                else:
+                    emitted.append(self._buffer[0])
+                    self._buffer = self._buffer[1:]
+                continue
+
+            if close_idx != -1:
+                candidate = self._buffer[: close_idx + 1]
+                cit_pattern = (
+                    r"^\[Page\s*(\d+)\]$"
+                    if delimiter_type == "["
+                    else r"^\(Page\s*(\d+)\)$"
+                )
+                m = re.match(cit_pattern, candidate, re.IGNORECASE)
+                if m:
+                    try:
+                        page_num = int(m.group(1))
+                        if page_num in self.retrieved_pages:
+                            emitted.append(candidate)
+                    except ValueError:
+                        emitted.append(candidate)
+                else:
+                    emitted.append(candidate)
+                self._buffer = self._buffer[close_idx + 1 :]
+                continue
+
+            if len(self._buffer) < 30:
+                break
+
+            emitted.append(self._buffer[0])
+            self._buffer = self._buffer[1:]
+
+        return emitted
+
+    def flush(self) -> List[str]:
+        emitted: List[str] = []
+        if self._buffer:
+            emitted.append(self._buffer)
+            self._buffer = ""
+        return emitted
+
+
 def is_overview_or_meta_query(query: str) -> bool:
     """
     Detects if the student is asking for an overarching summary or broad overview
@@ -371,13 +551,20 @@ def verify_topical_evidence(
             [],
         )
 
-    # If score is modest (< 0.40) and term coverage is very low (< 0.30), reject
+    # If score is modest (< 0.40) and term coverage is very low (< 0.30), reject.
+    # EXCEPTION: If at least 1 term matched and score >= 0.38, allow partial-coverage English answers
+    # to proceed rather than issuing a false refusal (e.g. technical acronyms like SJF, FCFS, MICE
+    # that expand into terms present in the document).
     if max_score < 0.38 and coverage < 0.30:
         return (
             False,
             f"Insufficient evidence: topical overlap ({coverage:.0%}) and similarity ({max_score:.2f}) are too low.",
             matched,
         )
+
+    # Partial coverage gate: at least one term matched or score is reasonably high
+    if coverage >= 0.10 or max_score >= 0.38 or len(matched) >= 1:
+        return True, "Relevant evidence found.", matched
 
     return True, "Relevant evidence found.", matched
 
@@ -459,7 +646,7 @@ def format_context_prompt(
         f"{lang_directive}\n\n"
         f"1. Grounding & Citations: Cite exact page numbers [Page X] for facts drawn from the passages.\n"
         f"2. Partial Coverage: If the passages cover part of the question (e.g., definitions or objectives), answer those supported parts directly using [Page X] citations. Do NOT refuse the whole question.\n"
-        f"3. Note Gaps: If any subpart (e.g., detailed individual definitions or examples of anomalies) is only mentioned as an objective or omitted from the notes, clearly explain what the notes DO say with [Page X], state that individual details are omitted from the notes, and provide a concise simple clarification clearly distinguishing it from explicit notes content.\n"
+        f"3. Note Gaps & Supplementary Context: If any detail, proof, or step is omitted from the notes, clearly explain what the notes DO say with [Page X], state the omission explicitly, and if helpful, provide supplementary conceptual clarification clearly demarcated as '> **Supplementary Context (Not in notes):** ...' with NO [Page X] citations.\n"
         f"4. Insufficient Evidence: Only state that you could not find sufficient evidence if the passages have no factual connection to the topic.\n\n"
         f"ANSWER:"
     )
@@ -657,6 +844,19 @@ class AnswerGenerator:
     def ollama_enabled(self) -> bool:
         return os.getenv("OLLAMA_ENABLED", "false").lower() in ("true", "1")
 
+    @property
+    def ollama_model(self) -> str:
+        """Configured Ollama generation model. Default: qwen2.5:1.5b per DDRAG reference."""
+        return (os.getenv("OLLAMA_MODEL") or "qwen2.5:1.5b").strip()
+
+    @property
+    def ollama_timeout(self) -> float:
+        """Configurable Ollama generation timeout. Default: 30s for small local models."""
+        try:
+            return float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "30.0"))
+        except ValueError:
+            return 30.0
+
     def set_mock_mode(self, enabled: bool = True):
         """Used in automated unit tests."""
         self.mock_mode = enabled
@@ -753,7 +953,14 @@ class AnswerGenerator:
 
         # 4. Try Local Ollama if explicitly enabled
         if self.ollama_enabled:
-            ollama_res = await self._call_ollama(question, valid_candidates, sources)
+            ollama_res = await self._call_ollama(
+                question=question,
+                valid_candidates=valid_candidates,
+                all_retrieved=sources,
+                conversation_history=conversation_history,
+                scope=scope,
+                target_page=target_page,
+            )
             if ollama_res:
                 return ollama_res
 
@@ -868,6 +1075,22 @@ class AnswerGenerator:
             if gemini_streamed:
                 return
 
+        # Try streaming Ollama/Qwen if enabled
+        if self.ollama_enabled:
+            ollama_streamed = False
+            async for chunk in self._stream_ollama(
+                question=question,
+                valid_candidates=valid_candidates,
+                all_retrieved=sources,
+                conversation_history=conversation_history,
+                scope=scope,
+                target_page=target_page,
+            ):
+                ollama_streamed = True
+                yield chunk
+            if ollama_streamed:
+                return
+
         # Offline / Extractive fallback progressive streaming
         extractive_res = self._generate_extractive_grounded(
             question=question,
@@ -954,6 +1177,7 @@ class AnswerGenerator:
 
             accumulated_chunks: List[str] = []
             started_yielding = False
+            stream_filter = CitationStreamFilter(valid_candidates)
 
             try:
                 async with httpx.AsyncClient(timeout=client_timeout) as client:
@@ -1024,11 +1248,20 @@ class AnswerGenerator:
                                             p.get("text", "") for p in parts if "text" in p and p.get("text")
                                         )
                                         if text_piece:
-                                            accumulated_chunks.append(text_piece)
-                                            started_yielding = True
-                                            yield {"token": text_piece}
+                                            filtered_tokens = stream_filter.process_chunk(text_piece)
+                                            for tok in filtered_tokens:
+                                                accumulated_chunks.append(tok)
+                                                started_yielding = True
+                                                yield {"token": tok}
                                 except Exception as json_err:
                                     logger.debug("Error parsing SSE JSON: %s", json_err)
+
+                        # Flush any remaining lookahead buffer after stream loop ends
+                        leftover = stream_filter.flush()
+                        for tok in leftover:
+                            accumulated_chunks.append(tok)
+                            started_yielding = True
+                            yield {"token": tok}
                     finally:
                         await stream_ctx.__aexit__(None, None, None)
             except (httpx.TimeoutException, asyncio.TimeoutError):
@@ -1050,6 +1283,8 @@ class AnswerGenerator:
             if not full_text:
                 continue
 
+            # Safe citation validation: strip hallucinated [Page X] tags
+            full_text = validate_answer_citations(full_text, valid_candidates)
             cited = extract_cited_sources(full_text, valid_candidates, "found")
             if cited and not re.search(r"\bPage\s*\d+\b|\[Page\s*\d+\]", full_text, re.IGNORECASE):
                 pages_ref = ", ".join(f"[Page {c.get('page_number', 1)}]" for c in cited)
@@ -1155,6 +1390,8 @@ class AnswerGenerator:
                                         )
                                         return None
 
+                                    # Safe citation validation: strip hallucinated [Page X] tags
+                                    text = validate_answer_citations(text, valid_candidates)
                                     cited = extract_cited_sources(text, valid_candidates, "found")
                                     if cited and not re.search(r"\bPage\s*\d+\b|\[Page\s*\d+\]", text, re.IGNORECASE):
                                         ref_str = ", ".join(f"[Page {c.get('page_number', 1)}]" for c in cited)
@@ -1205,52 +1442,134 @@ class AnswerGenerator:
         return None
 
     async def _get_ollama_model(self, client: httpx.AsyncClient) -> Optional[str]:
-        configured = os.getenv("OLLAMA_MODEL", "").strip()
+        """Resolves the Ollama generation model to use.
+        Priority: OLLAMA_MODEL env var > auto-detect from running instance > qwen2.5:1.5b default.
+        """
+        configured = self.ollama_model
         if configured:
             return configured
         try:
-            res = await client.get(f"{self.ollama_host}/api/tags", timeout=1.5)
+            res = await client.get(f"{self.ollama_host}/api/tags", timeout=2.0)
             if res.status_code == 200:
                 models = res.json().get("models", [])
                 if models and len(models) > 0:
                     return models[0].get("name")
         except Exception:
             pass
-        return "llama3.2"
+        return "qwen2.5:1.5b"
+
+    def _format_ollama_messages(
+        self,
+        question: str,
+        valid_candidates: List[Dict[str, Any]],
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        scope: str = "targeted_concept",
+        target_page: Optional[int] = None,
+    ) -> List[Dict[str, str]]:
+        """
+        Formats a messages array for Ollama /api/chat (multi-turn).
+        Uses the same grounded prompt and document passages as Gemini.
+        """
+        messages: List[Dict[str, str]] = []
+
+        # System message with grounded instructions
+        messages.append({"role": "system", "content": GROUNDED_SYSTEM_PROMPT})
+
+        # Inject conversation history (last 6 turns) for multi-turn context
+        if conversation_history:
+            for turn in conversation_history[-6:]:
+                role = turn.get("role", "").lower().strip()
+                text = (turn.get("content") or "").strip()
+                if not text:
+                    continue
+                mapped_role = "user" if role == "user" else "assistant"
+                messages.append({"role": mapped_role, "content": text})
+
+        # Current question with full document passages
+        user_prompt = format_context_prompt(
+            question=question,
+            sources=valid_candidates,
+            scope=scope,
+            target_page=target_page,
+        )
+        messages.append({"role": "user", "content": user_prompt})
+
+        return messages
 
     async def _call_ollama(
         self,
         question: str,
         valid_candidates: List[Dict[str, Any]],
         all_retrieved: List[Dict[str, Any]],
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        scope: str = "targeted_concept",
+        target_page: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Attempts generation using local Ollama if explicitly enabled and running."""
-        prompt = format_context_prompt(question, valid_candidates)
+        """
+        Non-streaming generation via Ollama /api/chat (multi-turn).
+        Sends retrieved document passages + conversation history to a local Ollama model
+        (default: qwen2.5:1.5b). Applies citation validation before returning.
+        """
+        timeout = max(5.0, self.ollama_timeout)
+        messages = self._format_ollama_messages(
+            question=question,
+            valid_candidates=valid_candidates,
+            conversation_history=conversation_history,
+            scope=scope,
+            target_page=target_page,
+        )
+
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 model_name = await self._get_ollama_model(client)
                 if not model_name:
                     return None
-                url = f"{self.ollama_host}/api/generate"
+
+                url = f"{self.ollama_host}/api/chat"
                 payload = {
                     "model": model_name,
-                    "prompt": f"{GROUNDED_SYSTEM_PROMPT}\n\n{prompt}",
+                    "messages": messages,
                     "stream": False,
                     "options": {"temperature": 0.3},
                 }
-                res = await client.post(url, json=payload)
+                res = await asyncio.wait_for(
+                    client.post(url, json=payload),
+                    timeout=timeout,
+                )
+
+                if res.status_code == 404:
+                    logger.warning(
+                        "Ollama model '%s' not found (404). Pull it with: ollama pull %s",
+                        model_name,
+                        model_name,
+                    )
+                    return None
+
                 if res.status_code == 200:
                     data = res.json()
-                    response_text = data.get("response", "").strip()
+                    response_text = (data.get("message", {}).get("content") or "").strip()
+                    if not response_text:
+                        # Fallback: older Ollama versions use "response" key
+                        response_text = (data.get("response") or "").strip()
+
                     if response_text:
                         if is_refusal_response(response_text):
                             logger.warning(
-                                "Ollama returned refusal despite relevant candidates. "
-                                "Falling back to grounded partial synthesis."
+                                "Ollama/%s returned refusal despite relevant candidates. "
+                                "Falling back to grounded partial synthesis.",
+                                model_name,
                             )
                             return None
 
+                        # Safe citation validation: strip hallucinated [Page X] tags
+                        response_text = validate_answer_citations(response_text, valid_candidates)
                         cited = extract_cited_sources(response_text, valid_candidates, "found")
+
+                        # Ensure at least one inline page citation exists
+                        if cited and not re.search(r"\bPage\s*\d+\b|\[Page\s*\d+\]", response_text, re.IGNORECASE):
+                            ref_str = ", ".join(f"[Page {c.get('page_number', 1)}]" for c in cited)
+                            response_text = f"{response_text}\n\n{ref_str}"
+
                         return {
                             "answer": response_text,
                             "retrieval_status": "found",
@@ -1259,10 +1578,188 @@ class AnswerGenerator:
                             "generation_provider": "local_ollama",
                             "model_name": data.get("model", model_name),
                         }
+                else:
+                    logger.warning("Ollama returned HTTP %d for model '%s'.", res.status_code, model_name)
+
+        except (httpx.TimeoutException, asyncio.TimeoutError):
+            logger.warning("Ollama generation timed out after %.1fs.", timeout)
+        except httpx.ConnectError:
+            logger.info("Ollama not reachable at %s. Skipping local generation.", self.ollama_host)
         except Exception as e:
-            logger.debug(f"Ollama call skipped: {e}")
+            logger.debug("Ollama call failed: %s", e)
 
         return None
+
+    async def _stream_ollama(
+        self,
+        question: str,
+        valid_candidates: List[Dict[str, Any]],
+        all_retrieved: List[Dict[str, Any]],
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        scope: str = "targeted_concept",
+        target_page: Optional[int] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Streaming generation via Ollama /api/chat with stream=true.
+        Applies CitationStreamFilter to validate [Page X] citations in-flight.
+        Uses the same grounded system prompt and document passages as Gemini streaming.
+        """
+        timeout = max(5.0, self.ollama_timeout)
+        messages = self._format_ollama_messages(
+            question=question,
+            valid_candidates=valid_candidates,
+            conversation_history=conversation_history,
+            scope=scope,
+            target_page=target_page,
+        )
+
+        model_name: Optional[str] = None
+        accumulated_chunks: List[str] = []
+        started_yielding = False
+        stream_filter = CitationStreamFilter(valid_candidates)
+
+        try:
+            connect_timeout = min(5.0, timeout)
+            client_timeout = httpx.Timeout(
+                timeout=timeout,
+                connect=connect_timeout,
+                read=timeout,
+                write=min(5.0, timeout),
+                pool=min(3.0, timeout),
+            )
+            async with httpx.AsyncClient(timeout=client_timeout) as client:
+                model_name = await self._get_ollama_model(client)
+                if not model_name:
+                    return
+
+                url = f"{self.ollama_host}/api/chat"
+                payload = {
+                    "model": model_name,
+                    "messages": messages,
+                    "stream": True,
+                    "options": {"temperature": 0.3},
+                }
+
+                deadline = time.time() + timeout
+                stream_ctx = client.stream("POST", url, json=payload)
+                try:
+                    response = await asyncio.wait_for(
+                        stream_ctx.__aenter__(), timeout=connect_timeout,
+                    )
+                except (asyncio.TimeoutError, httpx.TimeoutException, httpx.ConnectError):
+                    logger.warning(
+                        "Ollama streaming connection failed/timed out for model '%s'.",
+                        model_name,
+                    )
+                    return
+
+                try:
+                    if response.status_code == 404:
+                        logger.warning(
+                            "Ollama model '%s' not found (404). Pull it with: ollama pull %s",
+                            model_name,
+                            model_name,
+                        )
+                        return
+                    if response.status_code != 200:
+                        logger.warning(
+                            "Ollama streaming returned HTTP %d for model '%s'.",
+                            response.status_code,
+                            model_name,
+                        )
+                        return
+
+                    line_iterator = response.aiter_lines().__aiter__()
+                    while True:
+                        remaining = deadline - time.time()
+                        if remaining <= 0:
+                            logger.warning(
+                                "Ollama streaming deadline (%.1fs) reached for '%s'. Terminating.",
+                                timeout,
+                                model_name,
+                            )
+                            break
+                        try:
+                            line = await asyncio.wait_for(
+                                line_iterator.__anext__(),
+                                timeout=min(remaining, timeout),
+                            )
+                        except StopAsyncIteration:
+                            break
+                        except (asyncio.TimeoutError, httpx.TimeoutException):
+                            logger.warning(
+                                "Ollama streaming chunk read timed out for '%s'.",
+                                model_name,
+                            )
+                            break
+
+                        if not line.strip():
+                            continue
+
+                        try:
+                            chunk_data = json.loads(line)
+                            # Ollama streaming sends {"message":{"content":"..."},"done":false}
+                            text_piece = (chunk_data.get("message", {}).get("content") or "").strip(" ")
+                            if not text_piece:
+                                # Check if this is the final done=true chunk
+                                if chunk_data.get("done"):
+                                    break
+                                continue
+
+                            # Apply in-flight citation validation
+                            filtered_tokens = stream_filter.process_chunk(text_piece)
+                            for tok in filtered_tokens:
+                                accumulated_chunks.append(tok)
+                                started_yielding = True
+                                yield {"token": tok}
+
+                            if chunk_data.get("done"):
+                                break
+                        except Exception as json_err:
+                            logger.debug("Error parsing Ollama streaming JSON: %s", json_err)
+
+                    # Flush any remaining lookahead buffer
+                    leftover = stream_filter.flush()
+                    for tok in leftover:
+                        accumulated_chunks.append(tok)
+                        started_yielding = True
+                        yield {"token": tok}
+
+                finally:
+                    await stream_ctx.__aexit__(None, None, None)
+
+        except httpx.ConnectError:
+            logger.info("Ollama not reachable at %s for streaming. Skipping.", self.ollama_host)
+            return
+        except (httpx.TimeoutException, asyncio.TimeoutError):
+            logger.warning("Ollama streaming timed out after %.1fs.", timeout)
+        except Exception as stream_err:
+            logger.debug("Ollama streaming exception: %s", stream_err)
+            if not started_yielding:
+                return
+
+        full_text = "".join(accumulated_chunks).strip()
+        if not full_text:
+            return
+
+        # Post-stream citation validation
+        full_text = validate_answer_citations(full_text, valid_candidates)
+        cited = extract_cited_sources(full_text, valid_candidates, "found")
+        if cited and not re.search(r"\bPage\s*\d+\b|\[Page\s*\d+\]", full_text, re.IGNORECASE):
+            pages_ref = ", ".join(f"[Page {c.get('page_number', 1)}]" for c in cited)
+            suffix = f"\n\n{pages_ref}"
+            full_text += suffix
+            yield {"token": suffix}
+
+        yield {
+            "done": True,
+            "answer": full_text,
+            "retrieval_status": "found",
+            "cited_sources": cited,
+            "retrieved_sources": all_retrieved,
+            "generation_provider": "local_ollama",
+            "model_name": model_name or self.ollama_model,
+        }
 
 
     def _generate_extractive_grounded(

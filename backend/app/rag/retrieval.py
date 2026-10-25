@@ -16,7 +16,7 @@ import numpy as np
 from starlette.concurrency import run_in_threadpool
 from app.rag.store import store_instance
 from app.rag.embeddings import embedding_service
-from app.rag.generator import STOP_AND_FILLER_WORDS, term_matches_text, extract_substantive_query_terms
+from app.rag.generator import STOP_AND_FILLER_WORDS, term_matches_text, extract_substantive_query_terms, detect_query_language
 
 logger = logging.getLogger("studysphere.retrieval")
 
@@ -37,6 +37,105 @@ DOCUMENT_SUMMARY_PATTERNS = [
     r"\b(kya\s+kya\s+topics?\s+(?:cover|hai|hain))\b",
     r"\b(all\s+topics|all\s+chapters|main\s+topics|main\s+points)\b",
 ]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hinglish Retrieval Query Normalizer
+# Applied ONLY to the internal embedding query – never to the user-facing question,
+# conversation history, generation prompt, or API response.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Multi-word Hinglish phrase patterns that are pure filler and carry no topical content.
+# These are removed before embedding to reduce cosine noise from filler tokens.
+_HINGLISH_PHRASE_DROP_PATTERNS: List[re.Pattern] = [
+    re.compile(r"\bke\s+baare?\s+(?:mein?|me)\b", re.IGNORECASE),   # ke bare mein / ke baare mein
+    re.compile(r"\bke\s+bare?\s+(?:mein?|me)\b", re.IGNORECASE),
+    re.compile(r"\bkya\s+(?:hote?|hoti|hai|hain|kya\s+hain|hote\s+hain)\b", re.IGNORECASE),  # kya hota hai etc
+    re.compile(r"\b(?:simple|saral|asaan)\s+bhasha\s+(?:mein?|me)\b", re.IGNORECASE),
+    re.compile(r"\bkya\s+kya\s+hain\b", re.IGNORECASE),
+    re.compile(r"\bkya\s+hain\b", re.IGNORECASE),
+    re.compile(r"\bkya\s+hai\b", re.IGNORECASE),
+]
+
+# Individual Hinglish tokens that are always pure filler when isolated.
+# These carry zero topical content relative to English academic notes.
+# Negation (nahi, mat, na), comparison (antar, farq), scope (sab, poore, saari),
+# temporal (pehle, baad) are intentionally EXCLUDED from this set.
+_HINGLISH_TOKEN_DROP: frozenset = frozenset({
+    # Question markers (content-neutral)
+    "kya", "kyun", "kyu", "kaise", "kese", "kab", "kahan", "kaha",
+    "kisko", "kisme", "kisne", "kitna", "kitne", "kitni",
+    # Postpositions / case markers
+    "ke", "ki", "ka", "ko", "se", "mein", "me", "pe", "par",
+    "baare", "bare",
+    # Conversational instruction verbs
+    "batao", "btao", "bataiye", "bata",
+    "samjhao", "samjha", "samjhana", "samjhaiye",
+    "bolo", "likho", "dikhao",
+    # Register-shift adjectives when used as meta-instructions
+    "simple", "saral", "asaan", "asan",
+    # Common connectors / grammatical particles
+    "aur",   # and
+    "bhi",   # also / even
+    "toh",
+    "yeh", "woh",
+    "bhasha", "tarike", "tarah",
+})
+
+
+def normalize_hinglish_retrieval_query(query: str) -> str:
+    """
+    Lightweight rule-based Hinglish query normalization for retrieval embedding.
+
+    SCOPE: Applied ONLY to the internal retrieval query vector.  The original
+    user question is NEVER modified; it continues to be used for language
+    detection, generation prompts, and conversation history.
+
+    Behaviour:
+    - English queries  → returned unchanged (no-op).
+    - Hindi (Devanagari) → returned unchanged (different language path).
+    - Hinglish queries → multi-word filler phrases stripped first, then
+      individual filler tokens dropped, preserving:
+        • Technical terms (MICE, FCFS, KNN, BCNF, SJF, …)
+        • Negation words  (nahi, mat, na)
+        • Comparison words (antar, farq)
+        • Scope words (sab, poore, saari)
+        • Temporal words (pehle, baad)
+        • All tokens ≥ 4 chars not on the drop list
+
+    If normalization produces an empty string (degenerate input), the
+    original query is returned as a safe fallback.
+    """
+    lang = detect_query_language(query)
+    if lang != "hinglish":
+        return query
+
+    result = query.lower().strip()
+
+    # Step 1: Remove multi-word filler phrases (order matters – longest first)
+    for pat in _HINGLISH_PHRASE_DROP_PATTERNS:
+        result = pat.sub(" ", result)
+
+    # Step 2: Token-level filtering
+    tokens = result.split()
+    kept = []
+    for tok in tokens:
+        clean_tok = re.sub(r"[^\w]", "", tok)
+        if not clean_tok:
+            continue
+        # Always keep: all-caps acronyms (MICE, FCFS, KNN, BCNF, SJF)
+        if clean_tok.upper() == clean_tok and len(clean_tok) >= 2:
+            kept.append(clean_tok)
+        # Drop known filler tokens
+        elif clean_tok in _HINGLISH_TOKEN_DROP:
+            pass
+        # Keep all substantive tokens ≥ 3 chars (preserves negation, comparison, etc.)
+        elif len(clean_tok) >= 3:
+            kept.append(clean_tok)
+        # Drop very short non-acronym tokens
+
+    normalized = " ".join(kept).strip()
+    return normalized if normalized else query
+
 
 # Patterns detecting comparisons / differences
 COMPARISON_PATTERNS = [
@@ -157,6 +256,18 @@ async def retrieve_document_context(
     clean_query = query.strip()
     target_doc_id = document_id.strip() if document_id and document_id.strip() else None
 
+    # Compute an internal-only retrieval query: Hinglish filler words removed so that
+    # the dense embedding focuses on topical content rather than conversational markers.
+    # The original clean_query is preserved and used for all intent detection, metadata,
+    # generation prompts, and API responses — only the embedding step uses retrieval_query.
+    retrieval_query = normalize_hinglish_retrieval_query(clean_query)
+    if retrieval_query != clean_query:
+        logger.debug(
+            "Hinglish retrieval normalization: '%s' -> '%s'",
+            clean_query,
+            retrieval_query,
+        )
+
     # Resolve document metadata to know total page count
     doc_meta = None
     if target_doc_id:
@@ -172,9 +283,10 @@ async def retrieve_document_context(
         page_chunks = [c for c in all_doc_chunks if c.get("page_number") == page_target]
 
         if page_chunks:
-            # Query embedding for ranking within the page if multiple chunks exist
+            # Query embedding for ranking within the page if multiple chunks exist.
+            # Use retrieval_query (Hinglish-normalized) for the embedding.
             try:
-                q_emb = await run_in_threadpool(embedding_service.embed_query, clean_query)
+                q_emb = await run_in_threadpool(embedding_service.embed_query, retrieval_query)
                 q_vec = np.asarray(q_emb, dtype=np.float32)
                 q_norm = np.linalg.norm(q_vec)
                 if q_norm > 0:
@@ -258,8 +370,10 @@ async def retrieve_document_context(
     is_comp, comp_aspects = extract_comparison_aspects(clean_query)
     query_terms = extract_substantive_query_terms(clean_query)
 
-    # Compute dense query vector
-    query_embedding = await run_in_threadpool(embedding_service.embed_query, clean_query)
+    # Compute dense query vector using Hinglish-normalized retrieval_query.
+    # This improves cosine similarity for Hinglish queries without modifying
+    # the original question, stored embeddings, or API contracts.
+    query_embedding = await run_in_threadpool(embedding_service.embed_query, retrieval_query)
 
     # Retrieve candidate chunks from store (dense search)
     raw_candidates = store_instance.search_chunks(

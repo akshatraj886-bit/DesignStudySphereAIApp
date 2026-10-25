@@ -26,9 +26,14 @@ def chunk_text(
     overlap_size: int = 100,
 ) -> List[str]:
     """
-    Splits a single block of text into overlapping windows.
-    Attempts natural boundary splits (paragraphs, sentences, or word boundaries)
-    rather than splitting words midway.
+    Splits a single block of text into boundary-aware overlapping windows.
+    Prioritizes natural boundaries in order of preference:
+      1. Paragraph breaks (\\n\\n)
+      2. Sentence terminators (. , .\\n, ? , ?\\n, ! , !\\n)
+      3. Line breaks / list items (\\n)
+      4. Clause delimiters (; , : )
+      5. Word boundaries (space)
+    Ensures sentences are not cut mid-phrase and overlap starts at clean word/sentence boundaries.
     """
     cleaned = text.strip()
     if not cleaned:
@@ -41,30 +46,74 @@ def chunk_text(
     start = 0
     total_len = len(cleaned)
 
+    primary_delimiters = [
+        "\n\n",
+        ".\n", ". ", ".\r\n",
+        "?\n", "? ",
+        "!\n", "! ",
+    ]
+    secondary_delimiters = [
+        "\n",
+        "; ",
+        ": ",
+    ]
+
     while start < total_len:
-        end = min(start + target_chunk_size, total_len)
+        # If remaining text fits within target chunk size, take it all
+        if total_len - start <= target_chunk_size:
+            chunk_slice = cleaned[start:total_len].strip()
+            if chunk_slice:
+                chunks.append(chunk_slice)
+            break
 
-        # If not at the end of text, attempt to break at a sentence or word boundary
-        if end < total_len:
-            # Look for a sentence-ending punctuation or newline in the last 60 chars of the window
-            lookback_zone = cleaned[max(start, end - 60):end]
-            best_break = -1
-            for punct in [".\n", ". ", "?\n", "? ", "!\n", "! ", "\n\n", "\n"]:
-                pos = lookback_zone.rfind(punct)
-                if pos != -1:
-                    candidate = max(start, end - 60) + pos + len(punct)
-                    if candidate > start + 50:  # Avoid overly tiny chunks
-                        best_break = candidate
+        ideal_end = start + target_chunk_size
+        max_end = min(total_len, ideal_end + min(80, target_chunk_size // 6))
+        min_end = start + max(100, target_chunk_size // 2)
+
+        best_break = -1
+
+        # Search for primary sentence/paragraph boundaries in [min_end, max_end]
+        search_zone = cleaned[min_end:max_end]
+        best_dist = float("inf")
+
+        for delim in primary_delimiters:
+            pos = 0
+            while True:
+                idx = search_zone.find(delim, pos)
+                if idx == -1:
+                    break
+                candidate = min_end + idx + len(delim)
+                dist = abs(candidate - ideal_end)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_break = candidate
+                pos = idx + 1
+
+        # If no primary delimiter found, search for secondary delimiters (lines, clauses)
+        if best_break == -1:
+            best_dist = float("inf")
+            for delim in secondary_delimiters:
+                pos = 0
+                while True:
+                    idx = search_zone.find(delim, pos)
+                    if idx == -1:
                         break
+                    candidate = min_end + idx + len(delim)
+                    dist = abs(candidate - ideal_end)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_break = candidate
+                    pos = idx + 1
 
-            if best_break != -1:
-                end = best_break
+        # If no sentence/clause boundary found, fall back to word boundary (space)
+        if best_break == -1:
+            space_pos = cleaned.rfind(" ", min_end, ideal_end)
+            if space_pos != -1:
+                best_break = space_pos + 1
             else:
-                # Fall back to word boundary (space)
-                space_pos = cleaned.rfind(" ", start + 50, end)
-                if space_pos != -1:
-                    end = space_pos + 1
+                best_break = ideal_end
 
+        end = best_break
         chunk_slice = cleaned[start:end].strip()
         if chunk_slice:
             chunks.append(chunk_slice)
@@ -72,11 +121,33 @@ def chunk_text(
         if end >= total_len:
             break
 
-        # Move forward, respecting the specified overlap
-        next_start = end - overlap_size
-        if next_start <= start:
-            next_start = start + max(1, target_chunk_size // 2)
-        start = next_start
+        # Calculate boundary-aware overlap
+        desired_overlap_start = max(start + 1, end - overlap_size)
+        overlap_search_zone = cleaned[desired_overlap_start:end]
+
+        overlap_start = -1
+        # Look for a sentence or line start in the overlap window
+        for delim in ["\n\n", ".\n", ". ", "\n"]:
+            idx = overlap_search_zone.find(delim)
+            if idx != -1:
+                cand = desired_overlap_start + idx + len(delim)
+                if cand < end - 20:  # Ensure remaining overlap has substantive context
+                    overlap_start = cand
+                    break
+
+        if overlap_start == -1:
+            # Fall back to word boundary so we never cut words mid-letter
+            space_idx = cleaned.find(" ", desired_overlap_start, end)
+            if space_idx != -1:
+                overlap_start = space_idx + 1
+            else:
+                overlap_start = desired_overlap_start
+
+        # Safe forward progress guarantee
+        if overlap_start <= start or overlap_start >= end:
+            overlap_start = start + max(1, (end - start) // 2)
+
+        start = overlap_start
 
     return chunks
 
