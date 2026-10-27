@@ -30,8 +30,8 @@ This is the production-grade Python + FastAPI backend service for **StudySphere 
        │
        ▼
 [ Grounded Answer Generator ]
- ├── Google Gemini (if GEMINI_API_KEY is configured)
- ├── Local Ollama (if running on localhost:11434)
+ ├── Google Gemini (GENERATION_PROVIDER=auto|gemini and GEMINI_API_KEY is set)
+ ├── Local Ollama/Qwen (OLLAMA_ENABLED=true; preferred when GENERATION_PROVIDER=ollama)
  └── Extractive Grounded Synthesizer (default zero-API fallback)
 ```
 
@@ -61,11 +61,13 @@ This is the production-grade Python + FastAPI backend service for **StudySphere 
 - Enforces strict factual grounding: answers are derived **strictly** from retrieved passages.
 - Includes exact source document citations and page numbers.
 - Handles absent questions by explicitly returning `retrieval_status: "insufficient_evidence"`.
-- Provider priority:
-  1. **Google Gemini Flash** (`GEMINI_API_KEY` or `GOOGLE_API_KEY` in environment or `.env`).
-  2. **Local Ollama** (if running locally at `http://localhost:11434`).
-  3. **Extractive Grounded Synthesizer** (default offline fallback that quotes exact evidence passages with page citations without external API costs).
-  4. **Mock Provider** (for deterministic automated unit tests).
+- Provider selection (`GENERATION_PROVIDER`, default `auto`):
+  1. **`auto`**: Google Gemini first if `GEMINI_API_KEY` or `GOOGLE_API_KEY` is set, then local Ollama if `OLLAMA_ENABLED=true`, then the extractive synthesizer.
+  2. **`gemini`**: Prefer Gemini; keep the same Ollama-then-extractive fallback when Ollama is enabled.
+  3. **`ollama`**: Prefer local Ollama/Qwen (`OLLAMA_MODEL`, default `qwen2.5:1.5b`) and do **not** call Gemini. `OLLAMA_ENABLED` remains a hard safety gate; if it is false, Gemini is still skipped and the extractive synthesizer is used.
+  4. Invalid values are treated as `auto`.
+- Local Qwen requires Ollama installed, running at `OLLAMA_HOST` (default `http://localhost:11434`), and the model pulled (`ollama pull qwen2.5:1.5b`). The backend does not download models automatically.
+- **Extractive Grounded Synthesizer** remains the offline fallback. **Mock Provider** is used only in automated unit tests.
 
 ---
 
@@ -87,12 +89,32 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 pip install -r requirements.txt
 ```
 
-### Step 4 — Optional: Configure API Keys
-To use Google Gemini for generative answers, create a `.env` file in `backend/`:
+### Step 4 — Optional: Configure generation providers
+Copy the template (never commit secrets):
+```powershell
+copy .env.example .env
+```
+
+Google Gemini (optional, used by `GENERATION_PROVIDER=auto` or `gemini`):
 ```env
 GEMINI_API_KEY="your-gemini-api-key-here"
 ```
-*(If no API key is set, the system automatically uses the built-in Extractive Grounded Synthesizer, so no paid API key is required).*
+
+Local Qwen via Ollama (optional; does not replace embeddings):
+```env
+GENERATION_PROVIDER=ollama
+OLLAMA_ENABLED=true
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_MODEL=qwen2.5:1.5b
+OLLAMA_TIMEOUT_SECONDS=30.0
+```
+
+Install Ollama, start it, then pull the generation model once:
+```powershell
+ollama pull qwen2.5:1.5b
+```
+
+If Gemini is unset and Ollama is disabled or unavailable, the built-in Extractive Grounded Synthesizer is used. `all-MiniLM-L6-v2` embeddings are unchanged.
 
 ---
 

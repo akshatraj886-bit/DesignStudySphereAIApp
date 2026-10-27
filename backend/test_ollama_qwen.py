@@ -9,7 +9,8 @@ Validates:
 5. Failure handling: Ollama unreachable, model missing (404), timeout, refusal.
 6. Citation validation on Ollama-generated responses.
 7. Streaming Ollama with CitationStreamFilter.
-8. Configuration properties: OLLAMA_ENABLED, OLLAMA_MODEL, OLLAMA_TIMEOUT_SECONDS.
+8. Configuration properties: GENERATION_PROVIDER, OLLAMA_ENABLED, OLLAMA_MODEL, OLLAMA_TIMEOUT_SECONDS.
+9. GENERATION_PROVIDER=auto|gemini|ollama dispatch, including ollama-with-Gemini-key and disabled-Ollama safety gate.
 
 ALL tests use mocked HTTP responses — no live Ollama instance is required.
 Each test is clearly labeled as MOCKED.
@@ -95,20 +96,27 @@ def run_ollama_qwen_tests():
             "OLLAMA_HOST": "http://my-ollama:11434",
             "OLLAMA_MODEL": "qwen2.5:1.5b",
             "OLLAMA_TIMEOUT_SECONDS": "45.0",
+            "GENERATION_PROVIDER": "ollama",
         }):
             assert gen.ollama_enabled is True
             assert gen.ollama_host == "http://my-ollama:11434"
             assert gen.ollama_model == "qwen2.5:1.5b"
             assert gen.ollama_timeout == 45.0
+            assert gen.generation_provider_mode == "ollama"
 
         with patch.dict(os.environ, {
             "OLLAMA_ENABLED": "false",
             "OLLAMA_MODEL": "",
             "OLLAMA_TIMEOUT_SECONDS": "invalid",
+            "GENERATION_PROVIDER": "not-a-provider",
         }):
             assert gen.ollama_enabled is False
             assert gen.ollama_model == "qwen2.5:1.5b"  # default
             assert gen.ollama_timeout == 30.0  # fallback on invalid
+            assert gen.generation_provider_mode == "auto"  # invalid values fall back to auto
+
+        with patch.dict(os.environ, {"GENERATION_PROVIDER": ""}, clear=False):
+            assert gen.generation_provider_mode == "auto"
 
         print("  PASS: All configuration properties work correctly.")
         results["passed"] += 1
@@ -310,7 +318,10 @@ def run_ollama_qwen_tests():
             "model": "qwen2.5:1.5b",
             "message": {
                 "role": "assistant",
-                "content": "I don't have enough information to answer this question based on the provided context.",
+                "content": (
+                    "I could not find sufficient evidence in the uploaded document(s) "
+                    "to answer this question. The retrieved passages do not discuss this topic."
+                ),
             },
             "done": True,
         }
@@ -333,8 +344,9 @@ def run_ollama_qwen_tests():
                     )
                     assert t7_res.status_code == 200
                     data7 = t7_res.json()
-                    assert data7["generation_provider"] == "extractive_grounded_synthesizer"
-                    print(f"  PASS: Refusal detected and handled. Provider: {data7['generation_provider']}")
+                    assert data7["generation_provider"] == "extractive_grounded_synthesizer", \
+                        f"Expected extractive after refusal, got '{data7['generation_provider']}'"
+                    print(f"  PASS: Refusal fell through to extractive. Provider: {data7['generation_provider']}")
                     results["passed"] += 1
     except AssertionError as e:
         print(f"  FAIL: {e}")
@@ -464,6 +476,259 @@ def run_ollama_qwen_tests():
         print(f"  FAIL: {e}")
         results["failed"] += 1
 
+    def _mock_tags(model_name="qwen2.5:1.5b"):
+        mock_tags = MagicMock()
+        mock_tags.status_code = 200
+        mock_tags.json.return_value = {"models": [{"name": model_name}] if model_name else []}
+        return mock_tags
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Test 11: GENERATION_PROVIDER=auto preserves Gemini-first behavior (MOCKED)
+    # ─────────────────────────────────────────────────────────────────────────
+    print("\n[Test 11] MOCKED: GENERATION_PROVIDER=auto keeps Gemini-first dispatch...")
+    try:
+        mock_gemini = MagicMock()
+        mock_gemini.status_code = 200
+        mock_gemini.json.return_value = {
+            "candidates": [{"content": {"parts": [{"text": "Round Robin uses a time quantum [Page 1]."}]}}]
+        }
+        with patch.dict(os.environ, {
+            "GENERATION_PROVIDER": "auto",
+            "GEMINI_API_KEY": "AIzaFakeKey",
+            "OLLAMA_ENABLED": "true",
+            "OLLAMA_MODEL": "qwen2.5:1.5b",
+        }):
+            with patch("httpx.AsyncClient.post", return_value=mock_gemini):
+                t11_res = client.post(
+                    f"/api/chat/sessions/{session_id}/ask",
+                    json={"question": "What is Round Robin scheduling?"},
+                )
+                assert t11_res.status_code == 200
+                assert t11_res.json()["generation_provider"] == "google_gemini"
+        print("  PASS: auto mode selected google_gemini before Ollama.")
+        results["passed"] += 1
+    except AssertionError as e:
+        print(f"  FAIL: {e}")
+        results["failed"] += 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Test 12: GENERATION_PROVIDER=gemini selects Gemini when configured (MOCKED)
+    # ─────────────────────────────────────────────────────────────────────────
+    print("\n[Test 12] MOCKED: GENERATION_PROVIDER=gemini selects Gemini when a key is set...")
+    try:
+        mock_gemini = MagicMock()
+        mock_gemini.status_code = 200
+        mock_gemini.json.return_value = {
+            "candidates": [{"content": {"parts": [{"text": "Paging maps pages to frames [Page 2]."}]}}]
+        }
+        with patch.dict(os.environ, {
+            "GENERATION_PROVIDER": "gemini",
+            "GEMINI_API_KEY": "AIzaFakeKey",
+            "OLLAMA_ENABLED": "true",
+        }):
+            with patch("httpx.AsyncClient.post", return_value=mock_gemini):
+                t12_res = client.post(
+                    f"/api/chat/sessions/{session_id}/ask",
+                    json={"question": "What is paging?"},
+                )
+                assert t12_res.status_code == 200
+                assert t12_res.json()["generation_provider"] == "google_gemini"
+        print("  PASS: gemini mode selected google_gemini.")
+        results["passed"] += 1
+    except AssertionError as e:
+        print(f"  FAIL: {e}")
+        results["failed"] += 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Test 13: GENERATION_PROVIDER=ollama prefers Qwen even with a Gemini key (MOCKED)
+    # ─────────────────────────────────────────────────────────────────────────
+    print("\n[Test 13] MOCKED: ollama mode uses Qwen even when GEMINI_API_KEY is set...")
+    try:
+        gemini_called = {"value": False}
+
+        def post_side_effect(*args, **kwargs):
+            url = ""
+            if len(args) >= 2:
+                url = str(args[1])
+            elif len(args) == 1:
+                url = str(args[0])
+            url = str(kwargs.get("url", url))
+            if "generativelanguage.googleapis.com" in url:
+                gemini_called["value"] = True
+                raise AssertionError("Gemini must not be invoked when GENERATION_PROVIDER=ollama")
+            return mock_ollama_resp
+
+        with patch.dict(os.environ, {
+            "GENERATION_PROVIDER": "ollama",
+            "GEMINI_API_KEY": "AIzaFakeKeyStillPresent",
+            "GOOGLE_API_KEY": "",
+            "OLLAMA_ENABLED": "true",
+            "OLLAMA_MODEL": "qwen2.5:1.5b",
+        }):
+            with patch("httpx.AsyncClient.post", side_effect=post_side_effect):
+                with patch("httpx.AsyncClient.get", return_value=_mock_tags()):
+                    t13_res = client.post(
+                        f"/api/chat/sessions/{session_id}/ask",
+                        json={"question": "What is Round Robin scheduling?"},
+                    )
+                    assert t13_res.status_code == 200
+                    data13 = t13_res.json()
+                    assert data13["generation_provider"] == "local_ollama"
+                    assert data13["model_name"] == "qwen2.5:1.5b"
+                    assert gemini_called["value"] is False
+        print("  PASS: ollama mode selected local_ollama and skipped Gemini.")
+        results["passed"] += 1
+    except AssertionError as e:
+        print(f"  FAIL: {e}")
+        results["failed"] += 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Test 14: GENERATION_PROVIDER=ollama with OLLAMA_ENABLED=false (MOCKED)
+    # ─────────────────────────────────────────────────────────────────────────
+    print("\n[Test 14] MOCKED: ollama mode with OLLAMA_ENABLED=false uses extractive, not Gemini...")
+    try:
+        with patch.dict(os.environ, {
+            "GENERATION_PROVIDER": "ollama",
+            "GEMINI_API_KEY": "AIzaFakeKeyStillPresent",
+            "OLLAMA_ENABLED": "false",
+        }):
+            with patch("httpx.AsyncClient.post") as mock_post:
+                t14_res = client.post(
+                    f"/api/chat/sessions/{session_id}/ask",
+                    json={"question": "What is paging?"},
+                )
+                assert t14_res.status_code == 200
+                assert t14_res.json()["generation_provider"] == "extractive_grounded_synthesizer"
+                mock_post.assert_not_called()
+        print("  PASS: disabled Ollama safety gate skipped Gemini and used extractive fallback.")
+        results["passed"] += 1
+    except AssertionError as e:
+        print(f"  FAIL: {e}")
+        results["failed"] += 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Test 15: Missing model in /api/tags does not call /api/chat (MOCKED)
+    # ─────────────────────────────────────────────────────────────────────────
+    print("\n[Test 15] MOCKED: missing Ollama model in /api/tags skips chat and falls back...")
+    try:
+        with patch.dict(os.environ, {
+            "GENERATION_PROVIDER": "ollama",
+            "GEMINI_API_KEY": "",
+            "GOOGLE_API_KEY": "",
+            "OLLAMA_ENABLED": "true",
+            "OLLAMA_MODEL": "qwen2.5:1.5b",
+        }):
+            with patch("httpx.AsyncClient.post") as mock_post:
+                with patch("httpx.AsyncClient.get", return_value=_mock_tags("")):
+                    t15_res = client.post(
+                        f"/api/chat/sessions/{session_id}/ask",
+                        json={"question": "What is Round Robin scheduling?"},
+                    )
+                    assert t15_res.status_code == 200
+                    assert t15_res.json()["generation_provider"] == "extractive_grounded_synthesizer"
+                    mock_post.assert_not_called()
+        print("  PASS: preflight missing-model diagnostic skipped /api/chat and used extractive.")
+        results["passed"] += 1
+    except AssertionError as e:
+        print(f"  FAIL: {e}")
+        results["failed"] += 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Test 16: SSE token + done events remain compatible for Ollama (MOCKED)
+    # ─────────────────────────────────────────────────────────────────────────
+    print("\n[Test 16] MOCKED: Ollama streaming emits token events and a compatible done payload...")
+    try:
+        class MockOllamaStreamContext:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                class MockResp:
+                    status_code = 200
+
+                    async def aiter_lines(self):
+                        yield json.dumps({
+                            "message": {"content": "Paging divides memory into **pages** "},
+                            "done": False,
+                        })
+                        yield json.dumps({
+                            "message": {"content": "and frames [Page 2]."},
+                            "done": False,
+                        })
+                        yield json.dumps({"message": {"content": ""}, "done": True})
+
+                return MockResp()
+
+            async def __aexit__(self, *args):
+                pass
+
+        with patch.dict(os.environ, {
+            "GENERATION_PROVIDER": "ollama",
+            "GEMINI_API_KEY": "",
+            "GOOGLE_API_KEY": "",
+            "OLLAMA_ENABLED": "true",
+            "OLLAMA_MODEL": "qwen2.5:1.5b",
+        }):
+            with patch.object(httpx.AsyncClient, "stream", side_effect=MockOllamaStreamContext):
+                with patch("httpx.AsyncClient.get", return_value=_mock_tags()):
+                    stream_res = client.post(
+                        f"/api/chat/sessions/{session_id}/ask/stream",
+                        json={"question": "What is paging?"},
+                    )
+                    assert stream_res.status_code == 200
+                    events = []
+                    done_payload = None
+                    for line in stream_res.iter_lines():
+                        if line.startswith("data: "):
+                            ev = json.loads(line[6:])
+                            events.append(ev)
+                            if ev.get("done"):
+                                done_payload = ev
+                    token_events = [e for e in events if "token" in e]
+                    assert len(token_events) >= 1, f"Expected token events, got {events}"
+                    assert done_payload is not None and done_payload.get("done") is True
+                    assert done_payload.get("generation_provider") == "local_ollama"
+                    assert done_payload.get("model_name") == "qwen2.5:1.5b"
+                    assert done_payload.get("retrieval_status") == "found"
+                    assert "cited_sources" in done_payload
+                    assert "[Page 5]" not in (done_payload.get("answer") or "")
+        print("  PASS: SSE token/done contract preserved for local_ollama streaming.")
+        results["passed"] += 1
+    except AssertionError as e:
+        print(f"  FAIL: {e}")
+        results["failed"] += 1
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        results["failed"] += 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Test 17: Invalid GENERATION_PROVIDER falls back to auto (MOCKED)
+    # ─────────────────────────────────────────────────────────────────────────
+    print("\n[Test 17] MOCKED: invalid GENERATION_PROVIDER is treated as auto (Gemini-first)...")
+    try:
+        mock_gemini = MagicMock()
+        mock_gemini.status_code = 200
+        mock_gemini.json.return_value = {
+            "candidates": [{"content": {"parts": [{"text": "Round Robin uses a quantum [Page 1]."}]}}]
+        }
+        with patch.dict(os.environ, {
+            "GENERATION_PROVIDER": "banana",
+            "GEMINI_API_KEY": "AIzaFakeKey",
+            "OLLAMA_ENABLED": "true",
+        }):
+            with patch("httpx.AsyncClient.post", return_value=mock_gemini):
+                t17_res = client.post(
+                    f"/api/chat/sessions/{session_id}/ask",
+                    json={"question": "What is Round Robin scheduling?"},
+                )
+                assert t17_res.status_code == 200
+                assert t17_res.json()["generation_provider"] == "google_gemini"
+        print("  PASS: invalid provider value fell back to auto/Gemini-first.")
+        results["passed"] += 1
+    except AssertionError as e:
+        print(f"  FAIL: {e}")
+        results["failed"] += 1
+
     # ─────────────────────────────────────────────────────────────────────────
     # Summary
     # ─────────────────────────────────────────────────────────────────────────
@@ -475,7 +740,9 @@ def run_ollama_qwen_tests():
         print("ALL OLLAMA/QWEN INTEGRATION TESTS PASSED (ALL MOCKED).\n")
     else:
         print(f"WARNING: {results['failed']} test(s) failed.\n")
+    return results["failed"] == 0
 
 
 if __name__ == "__main__":
-    run_ollama_qwen_tests()
+    success = run_ollama_qwen_tests()
+    sys.exit(0 if success else 1)

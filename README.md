@@ -194,7 +194,7 @@ cd DesignStudySphereAIApp
    ```bash
    cp .env.example .env
    ```
-   *(Optional: Add your `GEMINI_API_KEY` in `.env` to enable Gemini generation; otherwise, the built-in offline Extractive Synthesizer will be used automatically).*
+   *(Optional: add `GEMINI_API_KEY` in `backend/.env` for Gemini. For local Qwen, set `GENERATION_PROVIDER=ollama`, `OLLAMA_ENABLED=true`, install Ollama, and run `ollama pull qwen2.5:1.5b`. Otherwise the extractive synthesizer is used.)*
 5. Start the FastAPI development server:
    ```bash
    uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
@@ -243,6 +243,11 @@ cd DesignStudySphereAIApp
 | `GEMINI_API_KEY` | Google AI Studio API Key | *(Optional; empty for offline fallback)* |
 | `GEMINI_MODEL` | Gemini model name | `gemini-flash-lite-latest` |
 | `GEMINI_TIMEOUT_SECONDS` | Request timeout for external LLM calls | `12.0` |
+| `GENERATION_PROVIDER` | Generation preference: `auto`, `gemini`, or `ollama` (invalid values become `auto`) | `auto` |
+| `OLLAMA_ENABLED` | Hard safety gate for local Ollama/Qwen (`true`/`1` to enable) | `false` |
+| `OLLAMA_HOST` | Ollama base URL | `http://localhost:11434` |
+| `OLLAMA_MODEL` | Local generation model (pull with `ollama pull qwen2.5:1.5b`) | `qwen2.5:1.5b` |
+| `OLLAMA_TIMEOUT_SECONDS` | Local Ollama generation timeout | `30.0` |
 | `DATABASE_URL` | Cloud PostgreSQL URI with SSL (Neon) | *(Optional; empty for local SQLite)* |
 | `RATE_LIMIT_ENABLED` | Enable in-memory sliding window rate limits | `true` |
 | `MAX_UPLOAD_SIZE_MB`| Max allowed PDF upload size in MB | `25` |

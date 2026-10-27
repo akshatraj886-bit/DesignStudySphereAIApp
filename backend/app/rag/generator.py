@@ -774,11 +774,14 @@ def get_chunk_key(chunk: Dict[str, Any]) -> str:
 
 class AnswerGenerator:
     """
-    Main generator dispatcher that selects the best available engine:
-    1. Gemini API (if key is set)
-    2. Local Ollama (if explicitly enabled and running)
-    3. Grounded Extractive Synthesizer (offline, student-friendly default fallback)
+    Main generator dispatcher. GENERATION_PROVIDER selects the preference:
+    - auto (default): Gemini first if an API key is set, then Ollama if enabled, then extractive.
+    - gemini: Prefer Gemini; keep the existing Ollama-then-extractive fallback when Ollama is enabled.
+    - ollama: Prefer local Ollama/Qwen and never call Gemini first. Requires OLLAMA_ENABLED=true.
+    Invalid GENERATION_PROVIDER values are treated as auto.
+    OLLAMA_ENABLED remains a hard safety gate and is never bypassed.
     """
+    VALID_GENERATION_PROVIDERS = ("auto", "gemini", "ollama")
 
     def __init__(self):
         self.mock_mode = False
@@ -856,6 +859,42 @@ class AnswerGenerator:
             return float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "30.0"))
         except ValueError:
             return 30.0
+
+    @property
+    def generation_provider_mode(self) -> str:
+        """
+        Resolves GENERATION_PROVIDER: auto | gemini | ollama.
+        Empty or invalid values fall back to auto so existing deployments stay Gemini-first.
+        """
+        raw = (os.getenv("GENERATION_PROVIDER") or "auto").strip().lower()
+        if raw not in self.VALID_GENERATION_PROVIDERS:
+            if raw:
+                logger.warning(
+                    "Invalid GENERATION_PROVIDER=%r. Falling back to 'auto'. Valid values: auto, gemini, ollama.",
+                    raw,
+                )
+            return "auto"
+        return raw
+
+    def _should_try_gemini(self) -> bool:
+        if not self.current_gemini_api_key:
+            return False
+        return self.generation_provider_mode in ("auto", "gemini")
+
+    def _should_try_ollama(self) -> bool:
+        mode = self.generation_provider_mode
+        if mode == "ollama":
+            if not self.ollama_enabled:
+                logger.warning(
+                    "GENERATION_PROVIDER=ollama but OLLAMA_ENABLED is not true. "
+                    "Set OLLAMA_ENABLED=true, start Ollama at %s, and pull the model with: ollama pull %s. "
+                    "Falling back to the extractive grounded synthesizer. Gemini is not invoked in ollama mode.",
+                    self.ollama_host,
+                    self.ollama_model,
+                )
+                return False
+            return True
+        return self.ollama_enabled
 
     def set_mock_mode(self, enabled: bool = True):
         """Used in automated unit tests."""
@@ -938,8 +977,8 @@ class AnswerGenerator:
                 "model_name": "mock-eval-v1",
             }
 
-        # 3. Try Google Gemini API if key is present
-        if self.current_gemini_api_key:
+        # 3. Try Google Gemini when selected by GENERATION_PROVIDER (auto/gemini) and a key is present
+        if self._should_try_gemini():
             gemini_res = await self._call_gemini(
                 question=question,
                 valid_candidates=valid_candidates,
@@ -951,8 +990,8 @@ class AnswerGenerator:
             if gemini_res:
                 return gemini_res
 
-        # 4. Try Local Ollama if explicitly enabled
-        if self.ollama_enabled:
+        # 4. Try Local Ollama/Qwen when enabled (and required for GENERATION_PROVIDER=ollama)
+        if self._should_try_ollama():
             ollama_res = await self._call_ollama(
                 question=question,
                 valid_candidates=valid_candidates,
@@ -1059,8 +1098,8 @@ class AnswerGenerator:
             }
             return
 
-        # Try streaming Gemini if key is present
-        if self.current_gemini_api_key:
+        # Try streaming Gemini when selected by GENERATION_PROVIDER (auto/gemini) and a key is present
+        if self._should_try_gemini():
             gemini_streamed = False
             async for chunk in self._stream_gemini(
                 question=question,
@@ -1075,8 +1114,8 @@ class AnswerGenerator:
             if gemini_streamed:
                 return
 
-        # Try streaming Ollama/Qwen if enabled
-        if self.ollama_enabled:
+        # Try streaming Ollama/Qwen when enabled (and required for GENERATION_PROVIDER=ollama)
+        if self._should_try_ollama():
             ollama_streamed = False
             async for chunk in self._stream_ollama(
                 question=question,
@@ -1458,6 +1497,85 @@ class AnswerGenerator:
             pass
         return "qwen2.5:1.5b"
 
+    @staticmethod
+    def _ollama_model_is_listed(configured: str, models: List[Dict[str, Any]]) -> bool:
+        """True if /api/tags lists the configured generation model (exact or tagged variant)."""
+        wanted = (configured or "").strip().lower()
+        if not wanted:
+            return False
+        for m in models:
+            name = str((m or {}).get("name") or (m or {}).get("model") or "").strip().lower()
+            if not name:
+                continue
+            if name == wanted:
+                return True
+            if name.startswith(wanted + ":") or name.startswith(wanted + "-"):
+                return True
+        return False
+
+    async def _is_configured_ollama_model_available(
+        self,
+        client: httpx.AsyncClient,
+        model_name: str,
+    ) -> bool:
+        """
+        Bounded preflight against Ollama /api/tags. Does not pull or download models.
+        Returns False (caller falls back) when Ollama is unreachable or the model is missing.
+        """
+        tags_timeout = 2.0
+        url = f"{self.ollama_host}/api/tags"
+        try:
+            res = await asyncio.wait_for(
+                client.get(url, timeout=tags_timeout),
+                timeout=tags_timeout,
+            )
+        except (httpx.TimeoutException, asyncio.TimeoutError):
+            logger.warning(
+                "Ollama /api/tags timed out after %.1fs. Cannot verify model '%s'. Skipping local generation.",
+                tags_timeout,
+                model_name,
+            )
+            return False
+        except httpx.ConnectError:
+            logger.info(
+                "Ollama not reachable at %s during model preflight. Skipping local generation.",
+                self.ollama_host,
+            )
+            return False
+        except Exception as e:
+            logger.debug("Ollama model preflight failed: %s", e)
+            return False
+
+        if res.status_code != 200:
+            logger.warning(
+                "Ollama /api/tags returned HTTP %d. Cannot verify model '%s'. Skipping local generation.",
+                res.status_code,
+                model_name,
+            )
+            return False
+
+        try:
+            models = res.json().get("models") or []
+        except Exception:
+            models = []
+
+        if self._ollama_model_is_listed(model_name, models):
+            return True
+
+        available = [
+            str(m.get("name") or m.get("model") or "")
+            for m in models
+            if (m.get("name") or m.get("model"))
+        ]
+        logger.warning(
+            "Ollama model '%s' is not installed. Pull it with: ollama pull %s. "
+            "The application will not download models automatically. Available models: %s",
+            model_name,
+            model_name,
+            available[:12] if available else "(none)",
+        )
+        return False
+
     def _format_ollama_messages(
         self,
         question: str,
@@ -1523,6 +1641,8 @@ class AnswerGenerator:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 model_name = await self._get_ollama_model(client)
                 if not model_name:
+                    return None
+                if not await self._is_configured_ollama_model_available(client, model_name):
                     return None
 
                 url = f"{self.ollama_host}/api/chat"
@@ -1630,6 +1750,8 @@ class AnswerGenerator:
             async with httpx.AsyncClient(timeout=client_timeout) as client:
                 model_name = await self._get_ollama_model(client)
                 if not model_name:
+                    return
+                if not await self._is_configured_ollama_model_available(client, model_name):
                     return
 
                 url = f"{self.ollama_host}/api/chat"
